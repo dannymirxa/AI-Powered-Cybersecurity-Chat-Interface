@@ -4,9 +4,9 @@ test_supervisor.py
 Interactive + automated smoke tests for the multi-agent supervisor.
 
 Run modes:
-  python -m agents.test_supervisor              # run all automated tests
-  python -m agents.test_supervisor --chat       # interactive REPL
-  python -m agents.test_supervisor --test <n>  # run a single test by number
+  python test_supervisor.py              # run all automated tests
+  python test_supervisor.py --chat       # interactive REPL
+  python test_supervisor.py --test <n>   # run a single test by number
 
 What is tested:
   1. RAG routing          — supervisor sends KB question to rag_agent
@@ -23,14 +23,13 @@ import asyncio
 import argparse
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
-# Adjust path so module resolves from project root
-from agents.supervisor import build_supervisor_graph, invoke, stream
+from supervisor_agent import build_supervisor_graph, invoke, stream
 
 
-# ── ANSI colours ──────────────────────────────────────────────────────────────
+# ── ANSI colours ───────────────────────────────────────────────────────────────
 GREEN  = "\033[92m"
 RED    = "\033[91m"
 YELLOW = "\033[93m"
@@ -38,38 +37,36 @@ CYAN   = "\033[96m"
 BOLD   = "\033[1m"
 RESET  = "\033[0m"
 
-def ok(msg):    print(f"  {GREEN}✅ {msg}{RESET}")
-def fail(msg):  print(f"  {RED}❌ {msg}{RESET}")
-def info(msg):  print(f"  {CYAN}ℹ  {msg}{RESET}")
-def warn(msg):  print(f"  {YELLOW}⚠  {msg}{RESET}")
+def ok(msg):   print(f"  {GREEN}\u2705 {msg}{RESET}")
+def fail(msg): print(f"  {RED}\u274c {msg}{RESET}")
+def info(msg): print(f"  {CYAN}\u2139  {msg}{RESET}")
+def warn(msg): print(f"  {YELLOW}\u26a0  {msg}{RESET}")
+
 def header(msg):
-    bar = "═" * 60
+    bar = "\u2550" * 60
     print(f"\n{BOLD}{bar}{RESET}")
     print(f"{BOLD}  {msg}{RESET}")
     print(f"{BOLD}{bar}{RESET}")
+
 def sub(msg):
-    print(f"\n{BOLD}{CYAN}▶ {msg}{RESET}")
+    print(f"\n{BOLD}{CYAN}\u25b6 {msg}{RESET}")
 
 
-# ── Test case definition ───────────────────────────────────────────────────────
+# ── Test case definition ──────────────────────────────────────────────────────
 
 @dataclass
 class TestCase:
-    number:      int
-    name:        str
-    description: str
-    # turns: list of (role, content) — enables multi-turn tests
-    turns:       list[tuple[str, str]]
-    # keywords that MUST appear in the last AI response (case-insensitive)
-    must_contain: list[str] = None
-    # keywords that must NOT appear (for rejection tests)
-    must_not_contain: list[str] = None
-    # if True, the test session is shared across turns (tests memory)
-    shared_session: bool = False
+    number:           int
+    name:             str
+    description:      str
+    turns:            list[tuple[str, str]]   # (role, content)
+    must_contain:     list[str] = field(default_factory=list)
+    must_not_contain: list[str] = field(default_factory=list)
+    shared_session:   bool = False            # True = all turns share one session_id
 
 
 TEST_CASES = [
-    # ── 1. RAG routing ─────────────────────────────────────────────────────
+    # ── 1. RAG routing ──────────────────────────────────────────────────
     TestCase(
         number=1,
         name="RAG Routing",
@@ -80,7 +77,7 @@ TEST_CASES = [
         must_contain=["nist", "recover"],
     ),
 
-    # ── 2. CVE routing ─────────────────────────────────────────────────────
+    # ── 2. CVE routing ──────────────────────────────────────────────────
     TestCase(
         number=2,
         name="CVE Lookup Routing",
@@ -91,7 +88,7 @@ TEST_CASES = [
         must_contain=["cve-2021-44228", "log4"],
     ),
 
-    # ── 3. IP reputation routing ────────────────────────────────────────────
+    # ── 3. IP reputation routing ─────────────────────────────────────────
     TestCase(
         number=3,
         name="IP Reputation Routing",
@@ -102,7 +99,7 @@ TEST_CASES = [
         must_contain=["185.220.101.1"],
     ),
 
-    # ── 4. Password audit routing ───────────────────────────────────────────
+    # ── 4. Password audit routing ─────────────────────────────────────────
     TestCase(
         number=4,
         name="Password Breach Routing",
@@ -113,7 +110,7 @@ TEST_CASES = [
         must_contain=["breach", "password"],
     ),
 
-    # ── 5. Multi-agent chaining ─────────────────────────────────────────────
+    # ── 5. Multi-agent chaining ──────────────────────────────────────────
     TestCase(
         number=5,
         name="Multi-Agent Chain (CVE + Framework)",
@@ -126,11 +123,11 @@ TEST_CASES = [
         must_contain=["cve-2023-23397", "nist"],
     ),
 
-    # ── 6. Multi-turn memory ────────────────────────────────────────────────
+    # ── 6. Multi-turn memory ───────────────────────────────────────────
     TestCase(
         number=6,
         name="Multi-Turn Conversation Memory",
-        description="Follow-up 'tell me more' should reference the previous topic without re-stating it",
+        description="Follow-ups should reference earlier context within the same session",
         shared_session=True,
         turns=[
             ("user", "What is the NIST CSF 'Govern' function?"),
@@ -140,7 +137,7 @@ TEST_CASES = [
         must_contain=["govern", "identify"],
     ),
 
-    # ── 7. Off-topic rejection ──────────────────────────────────────────────
+    # ── 7. Off-topic rejection ──────────────────────────────────────────
     TestCase(
         number=7,
         name="Off-Topic Rejection",
@@ -151,20 +148,19 @@ TEST_CASES = [
         must_not_contain=["coconut milk", "pandan", "sambal"],
     ),
 
-    # ── 8. Empty input guard ────────────────────────────────────────────────
+    # ── 8. Empty input guard ──────────────────────────────────────────
     TestCase(
         number=8,
         name="Empty Input Guard",
-        description="Empty message should not crash — should return a graceful response",
+        description="Blank message should not crash — should return a graceful response",
         turns=[
             ("user", "   ")
         ],
-        must_contain=[],    # just needs to not crash
     ),
 ]
 
 
-# ── Test runner ────────────────────────────────────────────────────────────────
+# ── Test runner ──────────────────────────────────────────────────────────────
 
 async def run_test(graph, test: TestCase) -> bool:
     """
@@ -174,29 +170,25 @@ async def run_test(graph, test: TestCase) -> bool:
     sub(f"[{test.number}] {test.name}")
     info(test.description)
 
-    session_id = str(uuid.uuid4())   # fresh session per test by default
+    session_id = str(uuid.uuid4())
     last_response = ""
     passed = True
 
     try:
         if test.shared_session:
-            # Multi-turn: all turns share the same session_id
             for role, content in test.turns:
-                label = "USER" if role == "user" else "ASSISTANT"
-                print(f"\n    {BOLD}[{label}]{RESET} {content.strip()}")
-                if role == "user":
-                    print(f"    {BOLD}[ASSISTANT]{RESET} ", end="", flush=True)
-                    last_response = ""
-                    async for chunk in stream(
-                        graph,
-                        [{"role": role, "content": content.strip()}],
-                        session_id=session_id,
-                    ):
-                        print(chunk, end="", flush=True)
-                        last_response += chunk
-                    print()
+                print(f"\n    {BOLD}[USER]{RESET} {content.strip()}")
+                print(f"    {BOLD}[ASSISTANT]{RESET} ", end="", flush=True)
+                last_response = ""
+                async for chunk in stream(
+                    graph,
+                    [{"role": role, "content": content.strip()}],
+                    session_id=session_id,
+                ):
+                    print(chunk, end="", flush=True)
+                    last_response += chunk
+                print()
         else:
-            # Single-turn (or independent turns)
             for role, content in test.turns:
                 print(f"    {BOLD}[USER]{RESET} {content.strip()}")
                 print(f"    {BOLD}[ASSISTANT]{RESET} ", end="", flush=True)
@@ -214,7 +206,7 @@ async def run_test(graph, test: TestCase) -> bool:
         fail(f"Exception raised: {exc}")
         return False
 
-    # ── Assertions ─────────────────────────────────────────────────────────
+    # ── Assertions ──────────────────────────────────────────────────────
     response_lower = last_response.lower()
 
     if test.must_contain:
@@ -256,91 +248,83 @@ async def run_all_tests(test_numbers: Optional[list[int]] = None):
 
     results = {}
 
-    async with build_supervisor_graph() as graph:
+    # build_supervisor_graph() is now a plain async function, not a context
+    # manager — it returns (graph, client). Keep both alive for all tests.
+    graph, client = await build_supervisor_graph()
+
+    try:
         for test in cases:
             passed = await run_test(graph, test)
             results[test.number] = (test.name, passed)
             print()
+    finally:
+        # client holds the MCP subprocess — nothing explicit needed,
+        # the subprocess exits when Python process ends, but be explicit.
+        pass
 
-    # ── Summary ────────────────────────────────────────────────────────────
+    # ── Summary ──────────────────────────────────────────────────────
     header("Results Summary")
     total  = len(results)
-    passed = sum(1 for _, (_, p) in results.items() if p)
-    failed = total - passed
+    n_pass = sum(1 for _, (_, p) in results.items() if p)
+    n_fail = total - n_pass
 
     for num, (name, p) in results.items():
         status = f"{GREEN}PASS{RESET}" if p else f"{RED}FAIL{RESET}"
         print(f"  [{status}]  {num}. {name}")
 
     print()
-    print(f"  {BOLD}Total: {total}  |  Passed: {GREEN}{passed}{RESET}  |  Failed: {RED}{failed}{RESET}{BOLD}{RESET}")
+    print(f"  {BOLD}Total: {total}  |  Passed: {GREEN}{n_pass}{RESET}  |  Failed: {RED}{n_fail}{RESET}{BOLD}{RESET}")
 
-    if failed:
+    if n_fail:
         sys.exit(1)
 
-
-# ── Interactive REPL ──────────────────────────────────────────────────────────
 
 async def interactive_chat():
     """Simple multi-turn REPL for manual testing."""
     header("CyberSec AI — Interactive Test Chat")
-    print("  Type your message and press Enter. Type 'new' for a new session.")
-    print("  Type 'exit' or Ctrl-C to quit.\n")
+    print("  Type your message and press Enter.")
+    print("  Type 'new' for a new session, 'exit' or Ctrl-C to quit.\n")
 
     session_id = str(uuid.uuid4())
     info(f"Session ID: {session_id}")
 
-    async with build_supervisor_graph() as graph:
-        while True:
-            try:
-                user_input = input(f"\n{BOLD}You:{RESET} ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print("\n\nGoodbye.")
-                break
+    graph, client = await build_supervisor_graph()
 
-            if not user_input:
-                continue
+    while True:
+        try:
+            user_input = input(f"\n{BOLD}You:{RESET} ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n\nGoodbye.")
+            break
 
-            if user_input.lower() == "exit":
-                print("Goodbye.")
-                break
+        if not user_input:
+            continue
+        if user_input.lower() == "exit":
+            print("Goodbye.")
+            break
+        if user_input.lower() == "new":
+            session_id = str(uuid.uuid4())
+            info(f"New session started: {session_id}")
+            continue
 
-            if user_input.lower() == "new":
-                session_id = str(uuid.uuid4())
-                info(f"New session started: {session_id}")
-                continue
+        print(f"\n{BOLD}Assistant:{RESET} ", end="", flush=True)
+        try:
+            async for chunk in stream(
+                graph,
+                [{"role": "user", "content": user_input}],
+                session_id=session_id,
+            ):
+                print(chunk, end="", flush=True)
+        except Exception as exc:
+            print(f"\n{RED}Error: {exc}{RESET}")
+        print()
 
-            print(f"\n{BOLD}Assistant:{RESET} ", end="", flush=True)
-            try:
-                async for chunk in stream(
-                    graph,
-                    [{"role": "user", "content": user_input}],
-                    session_id=session_id,
-                ):
-                    print(chunk, end="", flush=True)
-            except Exception as exc:
-                print(f"\n{RED}Error: {exc}{RESET}")
-            print()
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Supervisor test suite / interactive chat"
-    )
-    parser.add_argument(
-        "--chat",
-        action="store_true",
-        help="Launch interactive multi-turn chat REPL",
-    )
-    parser.add_argument(
-        "--test",
-        type=int,
-        nargs="+",
-        metavar="N",
-        help="Run specific test(s) by number (e.g. --test 1 6)",
-    )
+    parser = argparse.ArgumentParser(description="Supervisor test suite / interactive chat")
+    parser.add_argument("--chat", action="store_true", help="Launch interactive REPL")
+    parser.add_argument("--test", type=int, nargs="+", metavar="N",
+                        help="Run specific test(s) by number (e.g. --test 1 6)")
     args = parser.parse_args()
 
     if args.chat:
