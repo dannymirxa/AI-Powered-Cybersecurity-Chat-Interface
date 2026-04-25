@@ -10,7 +10,7 @@ Tools  : lookup_cve, check_ip  (from MCP server)
 """
 
 from langchain_ollama import ChatOllama
-from langgraph.prebuilt import create_agent
+from langchain.agents import create_agent
 
 SYSTEM_PROMPT = """You are a Threat Intelligence Analyst with access to live
 vulnerability and IP reputation databases.
@@ -52,6 +52,6 @@ def create_threat_agent(tools: list):
         model=llm,
         tools=threat_tools,
         name="threat_agent",
-        prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT,
     )
     return agent

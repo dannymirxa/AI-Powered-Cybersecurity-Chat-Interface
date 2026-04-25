@@ -10,7 +10,7 @@ Tools  : check_breach  (from MCP server)
 """
 
 from langchain_ollama import ChatOllama
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 
 SYSTEM_PROMPT = """You are a Security Auditor specialised in credential hygiene
 and access control policy.
@@ -47,10 +47,10 @@ def create_audit_agent(tools: list):
         num_ctx=4096,
     )
 
-    agent = create_react_agent(
+    agent = create_agent(
         model=llm,
         tools=audit_tools,
         name="audit_agent",
-        prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT,
     )
     return agent

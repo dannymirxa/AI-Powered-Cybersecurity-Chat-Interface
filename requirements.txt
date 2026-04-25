@@ -1,7 +1,8 @@
-langgraph 
-langgraph-supervisor
+langchain
 langchain-mcp-adapters
 langchain-ollamamcp
+langgraph
+langgraph-supervisor
 mcp[cli]
 pymilvus
 pymupdf4llm

@@ -9,7 +9,7 @@ Tools  : search_knowledge_base  (from MCP server)
 """
 
 from langchain_ollama import ChatOllama
-from langgraph.prebuilt import create_agent
+from langchain.agents import create_agent
 
 SYSTEM_PROMPT = """You are a Cybersecurity Knowledge Expert specialised in the
 NIST Cybersecurity Framework 2.0, risk management, and security best practices.
@@ -47,6 +47,6 @@ def create_rag_agent(tools: list):
         model=llm,
         tools=rag_tools,
         name="rag_agent",
-        prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT,
     )
     return agent
