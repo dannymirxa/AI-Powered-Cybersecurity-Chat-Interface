@@ -1,6 +1,6 @@
 """
-supervisor.py
-─────────────
+supervisor_agent.py
+───────────────────
 LangGraph multi-agent supervisor for the AI Cybersecurity Chat Interface.
 
 Architecture:
@@ -19,43 +19,49 @@ Architecture:
                     (mcp_rag_server.py via stdio)
 
 Session memory:
-    MemorySaver checkpointer persists full message history per thread_id.
+    MilvusCheckpointer persists full message history per thread_id to Milvus.
     Each chat session gets a unique thread_id — the graph replays the full
     history on every turn so the supervisor + agents see prior context.
 
+NOTE: langchain-mcp-adapters >=0.1.0 removed context manager support from
+      MultiServerMCPClient. Tools must be fetched with await client.get_tools().
+
 Usage (single turn):
-    async with build_supervisor_graph() as graph:
-        result = await invoke(graph, messages, session_id="abc123")
+    graph, client = await build_supervisor_graph()
+    result = await invoke(graph, messages, session_id="abc123")
+    await client.close()   # or let it GC — stdio subprocess exits with process
 
 Usage (streaming):
-    async with build_supervisor_graph() as graph:
-        async for chunk in stream(graph, messages, session_id="abc123"):
-            print(chunk, end="", flush=True)
+    graph, client = await build_supervisor_graph()
+    async for chunk in stream(graph, messages, session_id="abc123"):
+        print(chunk, end="", flush=True)
 """
 
 import os
 import sys
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
 
+from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_ollama import ChatOllama
-from agents.milvus_checkpointer import MilvusCheckpointer
 from langgraph_supervisor import create_supervisor
 
+from agents.milvus_checkpointer import MilvusCheckpointer
 from agents.rag_agent import create_rag_agent
 from agents.threat_agent import create_threat_agent
 from agents.audit_agent import create_audit_agent
 
-# ── Config ────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+# ── Config ─────────────────────────────────────────────────────────────────────
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+SUPERVISOR_MODEL = os.getenv("SUPERVISOR_MODEL", "qwen2.5:14b")
 
-MCP_SERVER_PATH = str(
-    Path(__file__).resolve().parent.parent / "mcp_rag_server.py"
-)
+# mcp_rag_server.py lives at the project root (same level as this file)
+MCP_SERVER_PATH = str(Path(__file__).resolve().parent / "mcp_rag_server.py")
 
+# Forward relevant env vars to the MCP subprocess
 MCP_ENV = {
     k: os.environ[k]
     for k in ("ABUSEIPDB_API_KEY", "MILVUS_URI", "OLLAMA_URL")
@@ -97,26 +103,33 @@ Always present the final answer in a structured, readable format.
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
-@asynccontextmanager
-async def build_supervisor_graph() -> AsyncIterator:
+async def build_supervisor_graph():
     """
-    Async context manager that:
-      1. Spawns the MCP server as a subprocess (stdio transport)
-      2. Loads all 4 tools from it
-      3. Builds the three specialist agents
-      4. Wraps them in a LangGraph supervisor compiled with MemorySaver
-      5. Yields the compiled, session-aware graph
-      6. Cleans up the MCP connection on exit
+    Build and return the compiled LangGraph supervisor.
 
-    The same graph instance should be reused across the entire app lifetime
-    (e.g. created once at FastAPI startup), not recreated per request.
-    MemorySaver holds all sessions in-memory — swap for SqliteSaver or
-    PostgresSaver for persistence across server restarts.
+    langchain-mcp-adapters >=0.1.0 removed context manager support —
+    MultiServerMCPClient is now initialised directly and tools fetched
+    with await client.get_tools().
+
+    The MCP server (mcp_rag_server.py) is spawned as a stdio subprocess
+    automatically by MultiServerMCPClient — no manual startup needed.
+
+    Returns:
+        tuple[CompiledGraph, MultiServerMCPClient]
+        Keep a reference to `client` for the lifetime of the app.
+        The subprocess exits automatically when the Python process ends.
 
     Example:
-        async with build_supervisor_graph() as graph:
-            result = await invoke(graph, msgs, session_id="u-123")
+        graph, client = await build_supervisor_graph()
+
+        # single turn
+        result = await invoke(graph, msgs, session_id="u-123")
+
+        # streaming
+        async for chunk in stream(graph, msgs, session_id="u-123"):
+            print(chunk, end="", flush=True)
     """
+    # ── Step 1: start MCP client and load tools ────────────────────────────────
     mcp_config = {
         "cybersec_tools": {
             "command": sys.executable,
@@ -126,43 +139,49 @@ async def build_supervisor_graph() -> AsyncIterator:
         }
     }
 
-    async with MultiServerMCPClient(mcp_config) as mcp_client:
-        tools = mcp_client.get_tools()
+    client = MultiServerMCPClient(mcp_config)
+    tools = await client.get_tools()   # ← correct API for >=0.1.0
 
-        # ── Specialist agents ─────────────────────────────────────────────────
-        rag_agent    = create_rag_agent(tools)
-        threat_agent = create_threat_agent(tools)
-        audit_agent  = create_audit_agent(tools)
+    print(f"✅ Loaded {len(tools)} MCP tools: {[t.name for t in tools]}")
 
-        # ── Supervisor LLM ────────────────────────────────────────────────────
-        supervisor_llm = ChatOllama(
-            model=os.getenv("SUPERVISOR_MODEL", "qwen2.5:14b"),
-            base_url=OLLAMA_BASE_URL,
-            temperature=0,
-            num_ctx=8192,
-        )
+    # ── Step 2: build specialist agents ───────────────────────────────────────
+    rag_agent    = create_rag_agent(tools)
+    threat_agent = create_threat_agent(tools)
+    audit_agent  = create_audit_agent(tools)
 
-        # ── Compile with MemorySaver ──────────────────────────────────────────
-        # MemorySaver stores conversation history keyed by thread_id.
-        # Each unique thread_id = one independent chat session.
-        checkpointer = MilvusCheckpointer()  # persists to Milvus chat_history collection
+    # ── Step 3: supervisor LLM ────────────────────────────────────────────────
+    supervisor_llm = ChatOllama(
+        model=SUPERVISOR_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        temperature=0,
+        num_ctx=8192,
+    )
 
-        workflow = create_supervisor(
-            agents=[rag_agent, threat_agent, audit_agent],
-            model=supervisor_llm,
-            prompt=SUPERVISOR_PROMPT,
-        )
+    # ── Step 4: Milvus-backed checkpointer for session memory ─────────────────
+    # Persists full conversation history per thread_id to Milvus.
+    # Survives server restarts — swap MemorySaver for this in production.
+    checkpointer = MilvusCheckpointer()
 
-        graph = workflow.compile(checkpointer=checkpointer)
-        yield graph
+    # ── Step 5: compile graph ─────────────────────────────────────────────────
+    workflow = create_supervisor(
+        agents=[rag_agent, threat_agent, audit_agent],
+        model=supervisor_llm,
+        prompt=SUPERVISOR_PROMPT,
+    )
+
+    graph = workflow.compile(checkpointer=checkpointer)
+
+    return graph, client
 
 
-# ── Session-aware call helpers ────────────────────────────────────────────────
+# ── Session config helper ─────────────────────────────────────────────────────
 
 def _thread_config(session_id: str) -> dict:
     """Build the LangGraph config dict for a given session."""
     return {"configurable": {"thread_id": session_id}}
 
+
+# ── Session-aware call helpers ────────────────────────────────────────────────
 
 async def invoke(graph, messages: list[dict], session_id: str) -> dict:
     """
