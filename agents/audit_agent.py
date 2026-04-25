@@ -7,13 +7,16 @@ Specialised agent: security audit & credential hygiene.
 
 Model  : AGENT_MODEL env var  (default: qwen2.5:3b)
 Tools  : check_breach  (from MCP server)
+
+Note: uses langgraph.prebuilt.create_react_agent (NOT langchain.agents.create_agent).
 """
 
 import os
 
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
-from langchain.agents import create_agent
+from langchain_core.messages import SystemMessage
+from langgraph.prebuilt import create_react_agent
 
 load_dotenv()
 
@@ -51,9 +54,9 @@ def create_audit_agent(tools: list):
     )
     print(f"✅ audit_agent model: {AGENT_MODEL}")
 
-    return create_agent(
+    return create_react_agent(
         model=llm,
         tools=audit_tools,
         name="audit_agent",
-        system_prompt=SYSTEM_PROMPT,
+        prompt=SystemMessage(content=SYSTEM_PROMPT),
     )
