@@ -1,4 +1,8 @@
-mcp
+langgraph 
+langgraph-supervisor
+langchain-mcp-adapters
+langchain-ollamamcp
+mcp[cli]
 pymilvus
 pymupdf4llm
 python-dotenv

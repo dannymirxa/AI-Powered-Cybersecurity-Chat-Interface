@@ -11,10 +11,10 @@ Tools:
   4. check_password_breach  — Pwned password check via HIBP k-anonymity (no key)
 
 CLI test:
-  python tools/rag_tool.py rag      "What is NIST CSF Govern function?"
-  python tools/rag_tool.py cve      CVE-2021-44228
-  python tools/rag_tool.py ip       8.8.8.8
-  python tools/rag_tool.py breach   password123
+  python tools/rag_tool.py rag     "What is NIST CSF Govern function?"
+  python tools/rag_tool.py cve     CVE-2021-44228
+  python tools/rag_tool.py ip      8.8.8.8
+  python tools/rag_tool.py breach  password123
 """
 
 import hashlib
@@ -40,8 +40,26 @@ DEFAULT_TIMEOUT = 15   # seconds for all HTTP calls
 # TOOL 1 — RAG: Semantic search over Milvus knowledge base
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_DEFAULT_TOP_K        = 5
-_SCORE_THRESHOLD      = 0.35   # cosine similarity — higher = more similar
+_DEFAULT_TOP_K   = 5
+
+# ┌─────────────────────────────────────────────────────────────────────────────
+# │ IMPORTANT — Milvus COSINE metric scoring explained
+# │
+# │ When metric_type="COSINE", Milvus returns `distance` as the COSINE
+# │ SIMILARITY (0.0–1.0), where:
+# │   1.0 = perfectly identical
+# │   0.0 = completely unrelated
+# │  -1.0 = opposite (rare in practice for text)
+# │
+# │ Results are already sorted best-first (highest distance = most similar).
+# │
+# │ DO NOT do `1 - distance` — that would invert the ranking and turn
+# │ the best match into the worst.
+# │
+# │ score_threshold filters OUT chunks BELOW the minimum similarity.
+# │ Example: threshold=0.60 keeps only chunks with ≥60% cosine similarity.
+# └─────────────────────────────────────────────────────────────────────────────
+_SCORE_THRESHOLD = 0.60   # sensible default — tune based on your data
 
 
 def _get_embedding(text: str) -> list[float]:
@@ -69,20 +87,27 @@ def search_cybersec_kb(
     """
     Semantic search over the cybersecurity knowledge base in Milvus.
 
+    Milvus COSINE metric returns `distance` as cosine SIMILARITY (0–1),
+    so we use it directly as the score — no inversion needed.
+    Chunks with score < score_threshold are discarded.
+
     Creates and closes its own MilvusClient unless one is passed in.
-    Pass a shared client (e.g., from MCP server lifespan) to avoid
+    Pass a shared client (e.g. from the MCP server lifespan) to avoid
     reconnecting on every call.
 
     Args:
         query:           Natural-language search string.
         top_k:           Maximum chunks to return (capped at 10).
-        score_threshold: Minimum similarity (0–1). Raise to tighten results.
+        score_threshold: Minimum cosine similarity (0–1).
+                         0.60 = 60% similar. Raise to get stricter results,
+                         lower to get more (but potentially weaker) matches.
         client:          Optional pre-connected MilvusClient.
 
     Returns:
         {
           "query":   str,
           "results": [{ text, source, chunk_index, score }, ...]
+                     sorted best-first, score is cosine similarity (0–1)
         }
     """
     top_k = min(top_k, 10)
@@ -92,6 +117,7 @@ def search_cybersec_kb(
 
     try:
         vector = _get_embedding(query)
+
         hits = client.search(
             collection_name=COLLECTION_NAME,
             data=[vector],
@@ -99,18 +125,26 @@ def search_cybersec_kb(
             output_fields=["text", "source", "chunk_index"],
             search_params={"metric_type": "COSINE"},
         )
+
         results = []
         for hit in hits[0]:
-            score = round(1 - hit["distance"], 4)
+            # `distance` from Milvus COSINE = cosine similarity directly
+            # Higher value = more similar — use as-is, never invert
+            score = round(hit["distance"], 4)
+
             if score < score_threshold:
-                continue
+                continue   # skip chunks below minimum similarity
+
             results.append({
                 "text":        hit["entity"]["text"],
                 "source":      hit["entity"]["source"],
                 "chunk_index": hit["entity"]["chunk_index"],
                 "score":       score,
             })
+
+        # Milvus already returns best-first, but re-sort to be explicit
         results.sort(key=lambda r: r["score"], reverse=True)
+
         return {"query": query, "results": results}
 
     finally:
@@ -202,7 +236,7 @@ def cve_lookup(
     resp = requests.get(_NVD_BASE, params=params, timeout=DEFAULT_TIMEOUT)
     resp.raise_for_status()
 
-    data = resp.json()
+    data  = resp.json()
     vulns = data.get("vulnerabilities", [])
     cves  = [_parse_cve(v["cve"]) for v in vulns]
 
@@ -216,7 +250,7 @@ def cve_lookup(
 # API docs: https://docs.abuseipdb.com
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_ABUSEIPDB_BASE = "https://api.abuseipdb.com/api/v2"
+_ABUSEIPDB_BASE      = "https://api.abuseipdb.com/api/v2"
 _MALICIOUS_THRESHOLD = 25   # confidence score % above which we flag as malicious
 
 
@@ -251,7 +285,6 @@ def check_ip_reputation(
         EnvironmentError:   If ABUSEIPDB_API_KEY is not set.
         requests.HTTPError: On API errors.
     """
-
     if not ABUSEIPDB_KEY:
         raise EnvironmentError(
             "ABUSEIPDB_API_KEY environment variable is not set. "
@@ -301,18 +334,18 @@ def check_password_breach(password: str) -> dict:
 
     Returns:
         {
-          "breached":      bool,
-          "times_found":   int   (0 if not breached),
-          "risk_level":    str   ("none" | "low" | "medium" | "high" | "critical"),
+          "breached":       bool,
+          "times_found":    int   (0 if not breached),
+          "risk_level":     str   ("none" | "low" | "medium" | "high" | "critical"),
           "recommendation": str
         }
 
     Raises:
         requests.HTTPError: On HIBP API errors.
     """
-    sha1    = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
-    prefix  = sha1[:5]
-    suffix  = sha1[5:]
+    sha1   = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix = sha1[:5]
+    suffix = sha1[5:]
 
     resp = requests.get(
         f"{_HIBP_BASE}/{prefix}",
@@ -321,7 +354,6 @@ def check_password_breach(password: str) -> dict:
     )
     resp.raise_for_status()
 
-    # Response is "HASH_SUFFIX:COUNT\r\n" per line
     counts = {}
     for line in resp.text.splitlines():
         parts = line.split(":")
@@ -360,7 +392,6 @@ def check_password_breach(password: str) -> dict:
 
 if __name__ == "__main__":
     import sys
-    import json
 
     USAGE = """
 Usage:
@@ -388,7 +419,8 @@ Examples:
         if tool_name == "rag":
             result = search_cybersec_kb(arg)
             if not result["results"]:
-                print("❌ No results above threshold.")
+                print(f"❌ No results above threshold ({_SCORE_THRESHOLD}).")
+                print("   Tip: lower score_threshold or rephrase the query.")
             else:
                 for i, r in enumerate(result["results"], 1):
                     print(f"\n── Result {i} ──────────────────────────────────────────")
