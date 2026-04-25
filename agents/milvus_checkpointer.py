@@ -4,7 +4,7 @@ milvus_checkpointer.py
 Milvus-backed conversation history store for LangGraph.
 
 Two responsibilities:
-  1. MilvusChatStore   — low-level CRUD for chat sessions in Milvus
+  1. MilvusChatStore    — low-level CRUD for chat sessions in Milvus
   2. MilvusCheckpointer — LangGraph BaseCheckpointSaver implementation
                           that plugs directly into graph.compile()
 
@@ -13,16 +13,19 @@ Collection schema  (chat_history):
   │ Field            │ Type       │ Notes                              │
   ├──────────────────┼────────────┼────────────────────────────────────┤
   │ id               │ VARCHAR    │ "{session_id}_{checkpoint_id}"     │
-  │ session_id       │ VARCHAR    │ one UUID per browser tab / session │
-  │ checkpoint_id    │ VARCHAR    │ LangGraph internal checkpoint uuid │
-  │ parent_id        │ VARCHAR    │ parent checkpoint (or "")          │
-  │ checkpoint_data  │ VARCHAR    │ JSON-serialised checkpoint blob    │
-  │ metadata         │ VARCHAR    │ JSON-serialised metadata           │
-  │ created_at       │ INT64      │ unix timestamp (ms)                │
+  │ session_id       │ VARCHAR    │ one UUID per browser tab / session  │
+  │ checkpoint_id    │ VARCHAR    │ LangGraph internal checkpoint uuid  │
+  │ parent_id        │ VARCHAR    │ parent checkpoint (or "")           │
+  │ checkpoint_data  │ VARCHAR    │ JSON-serialised checkpoint blob     │
+  │ metadata         │ VARCHAR    │ JSON-serialised metadata            │
+  │ created_at       │ INT64      │ unix timestamp (ms)                 │
+  │ _vec             │ FLOAT_VECTOR(1) │ dummy — Milvus requires ≥1 vector field │
   └──────────────────┴────────────┴────────────────────────────────────┘
 
-No vectors are stored here — this collection is purely for sequential
-message replay, not semantic search.
+Note on the dummy vector field:
+  Milvus 2.x requires every collection to have at least one FLOAT_VECTOR field.
+  The `_vec` field (dim=1, value always [0.0]) satisfies this constraint without
+  affecting query behaviour — all reads/writes use scalar fields only.
 
 Usage:
     from agents.milvus_checkpointer import MilvusCheckpointer
@@ -30,7 +33,6 @@ Usage:
     checkpointer = MilvusCheckpointer()          # uses MILVUS_URI env var
     graph = workflow.compile(checkpointer=checkpointer)
 
-    # Then call the graph with a thread_id as normal:
     config = {"configurable": {"thread_id": "session-uuid-here"}}
     await graph.ainvoke({"messages": [...]}, config=config)
 """
@@ -40,6 +42,7 @@ import os
 import time
 from typing import Any, AsyncIterator, Iterator, Optional, Sequence, Tuple
 
+from dotenv import load_dotenv
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
@@ -48,38 +51,34 @@ from langgraph.checkpoint.base import (
     CheckpointTuple,
     get_checkpoint_id,
 )
-from pymilvus import (
-    Collection,
-    CollectionSchema,
-    DataType,
-    FieldSchema,
-    MilvusClient,
-    connections,
-    utility,
-)
+from pymilvus import DataType, MilvusClient
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+load_dotenv()
+
+# ── Constants ─────────────────────────────────────────────────────────────────────
 
 COLLECTION_NAME = "chat_history"
 MILVUS_URI      = os.getenv("MILVUS_URI", "http://localhost:19530")
 
-# Field length limits (Milvus VARCHAR max = 65535)
-_ID_LEN          = 256
-_SESSION_LEN     = 128
-_CHECKPOINT_LEN  = 128
-_DATA_LEN        = 65535
-_META_LEN        = 4096
+_ID_LEN         = 256
+_SESSION_LEN    = 128
+_CHECKPOINT_LEN = 128
+_DATA_LEN       = 65535
+_META_LEN       = 4096
+_DUMMY_VEC_DIM  = 1      # smallest legal dimension; field is never queried
+_DUMMY_VEC_VAL  = [0.0]  # placeholder inserted on every write
 
 
-# ── Collection bootstrap ───────────────────────────────────────────────────────
+# ── Collection bootstrap ──────────────────────────────────────────────────────
 
 def ensure_chat_history_collection(uri: str = MILVUS_URI) -> None:
     """
     Create the chat_history collection in Milvus if it does not exist.
     Safe to call multiple times — idempotent.
 
-    Args:
-        uri: Milvus server URI (default: MILVUS_URI env var)
+    Milvus 2.x requires at least one FLOAT_VECTOR field per collection.
+    A dummy 1-dim vector field `_vec` is added to satisfy this constraint;
+    it is never used for search.
     """
     client = MilvusClient(uri=uri)
 
@@ -94,7 +93,7 @@ def ensure_chat_history_collection(uri: str = MILVUS_URI) -> None:
         description="LangGraph conversation checkpoint store",
     )
 
-    # Primary key — composite of session_id + checkpoint_id
+    # ─ Scalar fields ────────────────────────────────────────────────────────────
     schema.add_field(
         field_name="id",
         datatype=DataType.VARCHAR,
@@ -131,11 +130,29 @@ def ensure_chat_history_collection(uri: str = MILVUS_URI) -> None:
         datatype=DataType.INT64,
     )
 
-    # Index on session_id for fast per-session queries
+    # ─ Required dummy vector field ──────────────────────────────────────────────
+    # Milvus 2.x rejects a schema with no vector field.
+    # We add a 1-dim float vector that is never indexed or searched.
+    schema.add_field(
+        field_name="_vec",
+        datatype=DataType.FLOAT_VECTOR,
+        dim=_DUMMY_VEC_DIM,
+    )
+
+    # ─ Indexes ──────────────────────────────────────────────────────────────────
     index_params = client.prepare_index_params()
+
+    # Scalar index on session_id for fast per-session queries
     index_params.add_index(
         field_name="session_id",
-        index_type="",          # scalar field — auto index
+        index_type="",          # auto-select for scalar
+    )
+
+    # Flat index on dummy vector (required when a vector field exists)
+    index_params.add_index(
+        field_name="_vec",
+        index_type="FLAT",
+        metric_type="L2",
     )
 
     client.create_collection(
@@ -148,7 +165,7 @@ def ensure_chat_history_collection(uri: str = MILVUS_URI) -> None:
     client.close()
 
 
-# ── Low-level chat store ───────────────────────────────────────────────────────
+# ── Low-level chat store ─────────────────────────────────────────────────────────
 
 class MilvusChatStore:
     """
@@ -163,7 +180,7 @@ class MilvusChatStore:
     def close(self):
         self.client.close()
 
-    # ── Write ──────────────────────────────────────────────────────────────────
+    # ─ Write ─────────────────────────────────────────────────────────────────────
 
     def save(
         self,
@@ -173,7 +190,7 @@ class MilvusChatStore:
         checkpoint_data: dict,
         metadata: dict,
     ) -> None:
-        """Upsert a checkpoint record."""
+        """Upsert a checkpoint record. The dummy _vec field is always [0.0]."""
         record_id = f"{session_id}_{checkpoint_id}"
         self.client.upsert(
             collection_name=COLLECTION_NAME,
@@ -185,10 +202,11 @@ class MilvusChatStore:
                 "checkpoint_data": json.dumps(checkpoint_data, default=str),
                 "metadata":        json.dumps(metadata, default=str),
                 "created_at":      int(time.time() * 1000),
+                "_vec":            _DUMMY_VEC_VAL,   # ← satisfies Milvus requirement
             }],
         )
 
-    # ── Read ───────────────────────────────────────────────────────────────────
+    # ─ Read ──────────────────────────────────────────────────────────────────────
 
     def get_latest(self, session_id: str) -> Optional[dict]:
         """Return the most recent checkpoint for a session."""
@@ -202,7 +220,6 @@ class MilvusChatStore:
         )
         if not results:
             return None
-        # Sort by created_at descending, return latest
         latest = sorted(results, key=lambda r: r["created_at"], reverse=True)[0]
         return self._deserialise(latest)
 
@@ -239,7 +256,7 @@ class MilvusChatStore:
     def delete_session(self, session_id: str) -> int:
         """
         Delete all checkpoints for a session (i.e. clear chat history).
-        Returns the number of records deleted.
+        Returns number of records deleted.
         """
         results = self.client.query(
             collection_name=COLLECTION_NAME,
@@ -251,8 +268,6 @@ class MilvusChatStore:
             self.client.delete(collection_name=COLLECTION_NAME, ids=ids)
         return len(ids)
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
-
     @staticmethod
     def _deserialise(record: dict) -> dict:
         record["checkpoint_data"] = json.loads(record["checkpoint_data"])
@@ -260,18 +275,18 @@ class MilvusChatStore:
         return record
 
 
-# ── LangGraph checkpointer ─────────────────────────────────────────────────────
+# ── LangGraph checkpointer ─────────────────────────────────────────────────────────
 
 class MilvusCheckpointer(BaseCheckpointSaver):
     """
     LangGraph-compatible checkpoint saver backed by Milvus.
 
-    Plug this directly into graph.compile():
+    Plug directly into graph.compile():
 
         checkpointer = MilvusCheckpointer()
         graph = workflow.compile(checkpointer=checkpointer)
 
-    LangGraph will call put() after each node execution and get() at the
+    LangGraph calls put() after each node execution and get() at the
     start of each invocation to restore state.
     """
 
@@ -279,7 +294,7 @@ class MilvusCheckpointer(BaseCheckpointSaver):
         super().__init__()
         self.store = MilvusChatStore(uri=uri)
 
-    # ── Required by BaseCheckpointSaver ───────────────────────────────────────
+    # ─ Required by BaseCheckpointSaver ─────────────────────────────────────
 
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
         """Load the latest (or specific) checkpoint for a thread."""
@@ -324,7 +339,6 @@ class MilvusCheckpointer(BaseCheckpointSaver):
             return
         session_id = config["configurable"]["thread_id"]
         records    = self.store.list_checkpoints(session_id)
-
         count = 0
         for record in records:
             if limit and count >= limit:
@@ -383,7 +397,7 @@ class MilvusCheckpointer(BaseCheckpointSaver):
         """No-op: intermediate writes are not separately persisted."""
         pass
 
-    # ── Async variants (delegate to sync) ─────────────────────────────────────
+    # ─ Async variants (delegate to sync) ──────────────────────────────────
 
     async def aget_tuple(
         self, config: RunnableConfig
@@ -418,7 +432,7 @@ class MilvusCheckpointer(BaseCheckpointSaver):
     ) -> None:
         pass
 
-    # ── Utility methods ────────────────────────────────────────────────────────
+    # ─ Utility ──────────────────────────────────────────────────────────────────
 
     def clear_session(self, session_id: str) -> int:
         """
