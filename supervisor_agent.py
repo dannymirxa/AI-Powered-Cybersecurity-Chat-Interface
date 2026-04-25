@@ -5,36 +5,26 @@ LangGraph multi-agent supervisor for the AI Cybersecurity Chat Interface.
 
 Architecture:
                         ┌─────────────────┐
-                        │   SUPERVISOR    │  ← qwen2.5:14b (routing brain)
+                        │   SUPERVISOR    │  ← SUPERVISOR_MODEL (default: qwen2.5:3b)
                         │  (orchestrator) │
                         └────────┬────────┘
                  ┌───────────────┼───────────────┐
                  ▼               ▼               ▼
           ┌────────────┐  ┌────────────┐  ┌────────────┐
           │ rag_agent  │  │threat_agent│  │audit_agent │
-          │(qwen2.5:7b)│  │(qwen2.5:7b)│  │(qwen2.5:7b)│
+          │AGENT_MODEL │  │AGENT_MODEL │  │AGENT_MODEL │
+          │(def:3b)    │  │(def:3b)    │  │(def:3b)    │
           └────────────┘  └────────────┘  └────────────┘
                                 │
                         MCP Tool Server
                     (mcp_rag_server.py via stdio)
 
-Session memory:
-    MilvusCheckpointer persists full message history per thread_id to Milvus.
-    Each chat session gets a unique thread_id — the graph replays the full
-    history on every turn so the supervisor + agents see prior context.
+Model env vars (all optional — defaults shown):
+  SUPERVISOR_MODEL   qwen2.5:3b   orchestrator / router
+  AGENT_MODEL        qwen2.5:3b   all three sub-agents
 
-NOTE: langchain-mcp-adapters >=0.1.0 removed context manager support from
-      MultiServerMCPClient. Tools must be fetched with await client.get_tools().
-
-Usage (single turn):
-    graph, client = await build_supervisor_graph()
-    result = await invoke(graph, messages, session_id="abc123")
-    await client.close()   # or let it GC — stdio subprocess exits with process
-
-Usage (streaming):
-    graph, client = await build_supervisor_graph()
-    async for chunk in stream(graph, messages, session_id="abc123"):
-        print(chunk, end="", flush=True)
+Use larger models when you have VRAM to spare:
+  SUPERVISOR_MODEL=qwen2.5:14b AGENT_MODEL=qwen2.5:7b python test_supervisor.py
 """
 
 import os
@@ -55,8 +45,8 @@ load_dotenv()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-SUPERVISOR_MODEL = os.getenv("SUPERVISOR_MODEL", "qwen2.5:14b")
+OLLAMA_BASE_URL  = os.getenv("OLLAMA_URL",        "http://localhost:11434")
+SUPERVISOR_MODEL = os.getenv("SUPERVISOR_MODEL",  "qwen2.5:3b")
 
 # mcp_rag_server.py lives at the project root (same level as this file)
 MCP_SERVER_PATH = str(Path(__file__).resolve().parent / "mcp_rag_server.py")
@@ -107,29 +97,14 @@ async def build_supervisor_graph():
     """
     Build and return the compiled LangGraph supervisor.
 
-    langchain-mcp-adapters >=0.1.0 removed context manager support —
-    MultiServerMCPClient is now initialised directly and tools fetched
-    with await client.get_tools().
-
-    The MCP server (mcp_rag_server.py) is spawned as a stdio subprocess
-    automatically by MultiServerMCPClient — no manual startup needed.
+    Models are controlled by env vars:
+      SUPERVISOR_MODEL  (default: qwen2.5:3b)
+      AGENT_MODEL       (default: qwen2.5:3b, read inside each agent file)
 
     Returns:
         tuple[CompiledGraph, MultiServerMCPClient]
-        Keep a reference to `client` for the lifetime of the app.
-        The subprocess exits automatically when the Python process ends.
-
-    Example:
-        graph, client = await build_supervisor_graph()
-
-        # single turn
-        result = await invoke(graph, msgs, session_id="u-123")
-
-        # streaming
-        async for chunk in stream(graph, msgs, session_id="u-123"):
-            print(chunk, end="", flush=True)
     """
-    # ── Step 1: start MCP client and load tools ────────────────────────────────
+    # ── Step 1: MCP client ────────────────────────────────────────────────────
     mcp_config = {
         "cybersec_tools": {
             "command": sys.executable,
@@ -140,11 +115,10 @@ async def build_supervisor_graph():
     }
 
     client = MultiServerMCPClient(mcp_config)
-    tools = await client.get_tools()   # ← correct API for >=0.1.0
-
+    tools  = await client.get_tools()
     print(f"✅ Loaded {len(tools)} MCP tools: {[t.name for t in tools]}")
 
-    # ── Step 2: build specialist agents ───────────────────────────────────────
+    # ── Step 2: specialist agents ─────────────────────────────────────────────
     rag_agent    = create_rag_agent(tools)
     threat_agent = create_threat_agent(tools)
     audit_agent  = create_audit_agent(tools)
@@ -154,50 +128,31 @@ async def build_supervisor_graph():
         model=SUPERVISOR_MODEL,
         base_url=OLLAMA_BASE_URL,
         temperature=0,
-        num_ctx=8192,
+        num_ctx=4096,
     )
+    print(f"✅ Supervisor model: {SUPERVISOR_MODEL}")
 
-    # ── Step 4: Milvus-backed checkpointer for session memory ─────────────────
-    # Persists full conversation history per thread_id to Milvus.
-    # Survives server restarts — swap MemorySaver for this in production.
+    # ── Step 4: checkpointer ──────────────────────────────────────────────────
     checkpointer = MilvusCheckpointer()
 
-    # ── Step 5: compile graph ─────────────────────────────────────────────────
+    # ── Step 5: compile ───────────────────────────────────────────────────────
     workflow = create_supervisor(
         agents=[rag_agent, threat_agent, audit_agent],
         model=supervisor_llm,
         prompt=SUPERVISOR_PROMPT,
     )
-
     graph = workflow.compile(checkpointer=checkpointer)
 
     return graph, client
 
 
-# ── Session config helper ─────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _thread_config(session_id: str) -> dict:
-    """Build the LangGraph config dict for a given session."""
     return {"configurable": {"thread_id": session_id}}
 
 
-# ── Session-aware call helpers ────────────────────────────────────────────────
-
 async def invoke(graph, messages: list[dict], session_id: str) -> dict:
-    """
-    One-shot invocation with session memory.
-
-    Pass only the LATEST user message — LangGraph automatically appends it
-    to the thread's history and feeds the full history to the model.
-
-    Args:
-        graph:      Compiled graph from build_supervisor_graph()
-        messages:   [{"role": "user", "content": "..."}]  ← latest turn only
-        session_id: Unique session identifier (e.g. UUID per browser tab)
-
-    Returns:
-        Full LangGraph state dict — last message is the assistant reply.
-    """
     return await graph.ainvoke(
         {"messages": messages},
         config=_thread_config(session_id),
@@ -206,18 +161,8 @@ async def invoke(graph, messages: list[dict], session_id: str) -> dict:
 
 async def stream(graph, messages: list[dict], session_id: str):
     """
-    Streaming invocation with session memory.
-
-    Async generator — yields text chunks as they arrive from the final
-    assistant message. Suitable for SSE or WebSocket streaming.
-
-    Args:
-        graph:      Compiled graph from build_supervisor_graph()
-        messages:   [{"role": "user", "content": "..."}]  ← latest turn only
-        session_id: Unique session identifier
-
-    Yields:
-        str — incremental text chunks
+    Async generator — yields incremental text chunks from the final
+    assistant message. Suitable for SSE / WebSocket streaming.
     """
     seen_content = ""
 
@@ -226,10 +171,9 @@ async def stream(graph, messages: list[dict], session_id: str):
         config=_thread_config(session_id),
         stream_mode="values",
     ):
-        last = chunk["messages"][-1]
+        last    = chunk["messages"][-1]
         content = getattr(last, "content", None)
 
-        # Only yield the NEW portion of the final message to avoid repeats
         if content and isinstance(content, str) and content != seen_content:
             delta = content[len(seen_content):]
             if delta:
@@ -238,17 +182,6 @@ async def stream(graph, messages: list[dict], session_id: str):
 
 
 async def get_history(graph, session_id: str) -> list:
-    """
-    Return the full message history for a session.
-    Useful for restoring the UI after a page refresh.
-
-    Args:
-        graph:      Compiled graph from build_supervisor_graph()
-        session_id: Session identifier
-
-    Returns:
-        List of LangChain message objects (HumanMessage, AIMessage, etc.)
-    """
     state = await graph.aget_state(config=_thread_config(session_id))
     if state and state.values:
         return state.values.get("messages", [])
