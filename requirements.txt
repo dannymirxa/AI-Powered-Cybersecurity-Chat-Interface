@@ -1,0 +1,5 @@
+mcp
+pymilvus
+pymupdf4llm
+python-dotenv
+requests
