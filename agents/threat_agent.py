@@ -7,16 +7,13 @@ Specialised agent: live threat intelligence.
 
 Model  : AGENT_MODEL env var  (default: qwen2.5:3b)
 Tools  : lookup_cve, check_ip  (from MCP server)
-
-Note: uses langgraph.prebuilt.create_react_agent (NOT langchain.agents.create_agent).
 """
 
 import os
 
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 
 load_dotenv()
 
@@ -53,9 +50,9 @@ def create_threat_agent(tools: list):
     )
     print(f"✅ threat_agent model: {AGENT_MODEL}")
 
-    return create_react_agent(
+    return create_agent(
         model=llm,
         tools=threat_tools,
         name="threat_agent",
-        prompt=SystemMessage(content=SYSTEM_PROMPT),
+        system_prompt=SYSTEM_PROMPT,
     )

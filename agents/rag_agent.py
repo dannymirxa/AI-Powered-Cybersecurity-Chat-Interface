@@ -6,18 +6,13 @@ knowledge base (NIST CSF 2.0 docs stored in Milvus).
 
 Model  : AGENT_MODEL env var  (default: qwen2.5:3b)
 Tools  : search_knowledge_base  (from MCP server)
-
-Note: uses langgraph.prebuilt.create_react_agent (NOT langchain.agents.create_agent).
-      create_react_agent returns a proper LangGraph CompiledGraph node that
-      langgraph_supervisor can dispatch to correctly.
 """
 
 import os
 
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 
 load_dotenv()
 
@@ -49,9 +44,9 @@ def create_rag_agent(tools: list):
     )
     print(f"✅ rag_agent model: {AGENT_MODEL}")
 
-    return create_react_agent(
+    return create_agent(
         model=llm,
         tools=rag_tools,
         name="rag_agent",
-        prompt=SystemMessage(content=SYSTEM_PROMPT),
+        system_prompt=SYSTEM_PROMPT,
     )

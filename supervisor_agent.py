@@ -22,9 +22,6 @@ Architecture:
 Model env vars (all optional — defaults shown):
   SUPERVISOR_MODEL   qwen2.5:3b   orchestrator / router
   AGENT_MODEL        qwen2.5:3b   all three sub-agents
-
-Use larger models when you have VRAM to spare:
-  SUPERVISOR_MODEL=qwen2.5:14b AGENT_MODEL=qwen2.5:7b python test_supervisor.py
 """
 
 import os
@@ -32,6 +29,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+from langchain_core.messages import AIMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_ollama import ChatOllama
 from langgraph_supervisor import create_supervisor
@@ -48,10 +46,8 @@ load_dotenv()
 OLLAMA_BASE_URL  = os.getenv("OLLAMA_URL",        "http://localhost:11434")
 SUPERVISOR_MODEL = os.getenv("SUPERVISOR_MODEL",  "qwen2.5:3b")
 
-# mcp_rag_server.py lives at the project root (same level as this file)
 MCP_SERVER_PATH = str(Path(__file__).resolve().parent / "mcp_rag_server.py")
 
-# Forward relevant env vars to the MCP subprocess
 MCP_ENV = {
     k: os.environ[k]
     for k in ("ABUSEIPDB_API_KEY", "MILVUS_URI", "OLLAMA_URL")
@@ -81,7 +77,6 @@ Multi-agent situations — use both in order when:
 Context awareness:
   • You have full access to this session's conversation history
   • Use prior turns to resolve pronouns and follow-up questions
-    e.g. "tell me more about that" refers to the last topic discussed
   • Do not re-explain things you already covered unless asked
 
 Scope enforcement:
@@ -94,17 +89,7 @@ Always present the final answer in a structured, readable format.
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
 async def build_supervisor_graph():
-    """
-    Build and return the compiled LangGraph supervisor.
-
-    Models are controlled by env vars:
-      SUPERVISOR_MODEL  (default: qwen2.5:3b)
-      AGENT_MODEL       (default: qwen2.5:3b, read inside each agent file)
-
-    Returns:
-        tuple[CompiledGraph, MultiServerMCPClient]
-    """
-    # ── Step 1: MCP client ────────────────────────────────────────────────────
+    # ── MCP client ──────────────────────────────────────────────────────────
     mcp_config = {
         "cybersec_tools": {
             "command": sys.executable,
@@ -113,17 +98,16 @@ async def build_supervisor_graph():
             "env": MCP_ENV if MCP_ENV else None,
         }
     }
-
     client = MultiServerMCPClient(mcp_config)
     tools  = await client.get_tools()
     print(f"✅ Loaded {len(tools)} MCP tools: {[t.name for t in tools]}")
 
-    # ── Step 2: specialist agents ─────────────────────────────────────────────
+    # ── Specialist agents ────────────────────────────────────────────────────
     rag_agent    = create_rag_agent(tools)
     threat_agent = create_threat_agent(tools)
     audit_agent  = create_audit_agent(tools)
 
-    # ── Step 3: supervisor LLM ────────────────────────────────────────────────
+    # ── Supervisor LLM ──────────────────────────────────────────────────────
     supervisor_llm = ChatOllama(
         model=SUPERVISOR_MODEL,
         base_url=OLLAMA_BASE_URL,
@@ -132,17 +116,16 @@ async def build_supervisor_graph():
     )
     print(f"✅ Supervisor model: {SUPERVISOR_MODEL}")
 
-    # ── Step 4: checkpointer ──────────────────────────────────────────────────
+    # ── Checkpointer ─────────────────────────────────────────────────────────
     checkpointer = MilvusCheckpointer()
 
-    # ── Step 5: compile ───────────────────────────────────────────────────────
+    # ── Compile ───────────────────────────────────────────────────────────────
     workflow = create_supervisor(
         agents=[rag_agent, threat_agent, audit_agent],
         model=supervisor_llm,
         prompt=SUPERVISOR_PROMPT,
     )
     graph = workflow.compile(checkpointer=checkpointer)
-
     return graph, client
 
 
@@ -161,24 +144,57 @@ async def invoke(graph, messages: list[dict], session_id: str) -> dict:
 
 async def stream(graph, messages: list[dict], session_id: str):
     """
-    Async generator — yields incremental text chunks from the final
-    assistant message. Suitable for SSE / WebSocket streaming.
-    """
-    seen_content = ""
+    Async generator — yields incremental text chunks from the supervisor's
+    final AIMessage only.
 
-    async for chunk in graph.astream(
+    Strategy: collect all state updates, find the last AIMessage whose
+    `name` is NOT one of the sub-agents (i.e. it is the supervisor's
+    synthesised reply), and stream it as deltas.
+
+    The `Ignoring invalid packet type <class 'str'>` warning comes from
+    LangGraph receiving a raw str instead of a BaseMessage object inside
+    the messages list. We guard against this by only yielding content from
+    proper AIMessage instances that come from the supervisor node.
+    """
+    # Sub-agent names to exclude — their intermediate AIMessages are NOT
+    # the final answer we want to stream to the user.
+    SUB_AGENTS = {"rag_agent", "threat_agent", "audit_agent"}
+
+    last_ai_content = ""
+    seen_content    = ""
+
+    async for state in graph.astream(
         {"messages": messages},
         config=_thread_config(session_id),
         stream_mode="values",
     ):
-        last    = chunk["messages"][-1]
-        content = getattr(last, "content", None)
+        msgs = state.get("messages", [])
 
-        if content and isinstance(content, str) and content != seen_content:
-            delta = content[len(seen_content):]
+        # Walk messages in reverse to find the latest AIMessage that
+        # did NOT come from a named sub-agent (i.e. supervisor's reply).
+        for msg in reversed(msgs):
+            if not isinstance(msg, AIMessage):
+                continue
+            sender = getattr(msg, "name", None) or ""
+            if sender in SUB_AGENTS:
+                continue
+            # This is the supervisor's AIMessage
+            content = msg.content or ""
+            if isinstance(content, list):
+                # Some models return content as list of dicts with 'text' key
+                content = "".join(
+                    c.get("text", "") if isinstance(c, dict) else str(c)
+                    for c in content
+                )
+            last_ai_content = content
+            break
+
+        # Yield only the new delta since last iteration
+        if last_ai_content and last_ai_content != seen_content:
+            delta = last_ai_content[len(seen_content):]
             if delta:
                 yield delta
-            seen_content = content
+            seen_content = last_ai_content
 
 
 async def get_history(graph, session_id: str) -> list:
