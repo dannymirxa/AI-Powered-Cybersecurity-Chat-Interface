@@ -1,60 +1,31 @@
 """
 milvus_checkpointer.py
 ──────────────────────
-Milvus-backed conversation history store for LangGraph.
+Milvus-backed conversation history + session registry for LangGraph.
 
-Two responsibilities:
-  1. MilvusChatStore    — low-level CRUD for chat sessions in Milvus
-  2. MilvusCheckpointer — LangGraph BaseCheckpointSaver implementation
-                          that plugs directly into graph.compile()
+Collections:
+  chat_history   — LangGraph checkpoints (one row per checkpoint)
+  chat_sessions  — Session registry: one row per session with summary + timestamps
 
-Collection schema  (chat_history):
-  ┌──────────────────┬─────────────────┬────────────────────────────────────────┐
-  │ Field            │ Type            │ Notes                                  │
-  ├──────────────────┼─────────────────┼────────────────────────────────────────┤
-  │ id               │ VARCHAR(256)    │ "{session_id}_{checkpoint_id}"         │
-  │ session_id       │ VARCHAR(128)    │ one UUID per browser tab / session     │
-  │ checkpoint_id    │ VARCHAR(128)    │ LangGraph internal checkpoint uuid     │
-  │ parent_id        │ VARCHAR(128)    │ parent checkpoint (or "")              │
-  │ checkpoint_data  │ VARCHAR(65535)  │ gzip+base64 compressed slim checkpoint │
-  │ metadata         │ VARCHAR(4096)   │ JSON-serialised metadata               │
-  │ created_at       │ INT64           │ unix timestamp (ms)                    │
-  │ _vec             │ FLOAT_VECTOR(2) │ dummy — satisfies Milvus vector req    │
-  └──────────────────┴─────────────────┴────────────────────────────────────────┘
+chat_history schema:
+  id, session_id, checkpoint_id, parent_id,
+  checkpoint_data (gzip+b64, VARCHAR 65535),
+  metadata, created_at, _vec (dummy)
 
-Why checkpoints were too large (the bug this fixes):
-  LangGraph checkpoints store the FULL graph state including ALL messages
-  in the messages list.  Each turn adds:
-    - The user message
-    - Tool call messages (containing the raw tool invocation)
-    - ToolMessage objects with the FULL tool output (RAG results with entire
-      document chunks, CVE JSON payloads, IP reputation data, etc.)
-    - The final AI response
+chat_sessions schema:
+  session_id    VARCHAR(128)  PK
+  summary       VARCHAR(512)  first user message (truncated to 100 chars)
+  created_at    INT64         ms timestamp of first message
+  updated_at    INT64         ms timestamp of last activity
+  _vec          FLOAT_VECTOR(2)  dummy
 
-  RAG tool outputs alone can be 20–50 KB per turn.  After gzip compression
-  a 5-turn session was still 76–151 KB, well above the 65,535 char VARCHAR cap.
-
-The fix — slim the checkpoint before saving:
-  _slim_checkpoint() rewrites the messages list inside the checkpoint keeping:
-    ✓ HumanMessage     — always kept verbatim (user input, small)
-    ✓ AIMessage        — always kept verbatim (final answer, small)
-    ✓ ToolMessage      — content replaced with a short summary string;
-                          the full payload is never needed for future turns
-    ✓ All other keys   — kept as-is (channel versions, etc.)
-
-  A ToolMessage summary looks like:
-    "[tool_result: search_knowledge_base (truncated for storage)]"
-
-  This reduces a typical multi-turn checkpoint from 80–150 KB to 3–6 KB,
-  well within the 65,535 char limit even before compression.
-
-Note on the dummy vector field:
-  Milvus 2.x requires every collection to have at least one FLOAT_VECTOR field
-  with dim in range [2, 32768].  The `_vec` field (dim=2, value=[0.0, 0.0])
-  satisfies this without affecting query behaviour.
+Checkpoint slimming:
+  ToolMessage content is stripped before saving to keep checkpoint_data
+  within the 65,535 char VARCHAR limit.
 """
 
 import base64
+import copy
 import gzip
 import json
 import logging
@@ -79,67 +50,42 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ───────────────────────────────────────────────────────────────────
 
-COLLECTION_NAME = "chat_history"
-MILVUS_URI      = os.getenv("MILVUS_URI", "http://localhost:19530")
+CHECKPOINT_COLLECTION = "chat_history"
+SESSION_COLLECTION    = "chat_sessions"
+MILVUS_URI            = os.getenv("MILVUS_URI", "http://localhost:19530")
 
-_ID_LEN         = 256
-_SESSION_LEN    = 128
-_CHECKPOINT_LEN = 128
-_DATA_LEN       = 65535   # Milvus VARCHAR hard cap
-_META_LEN       = 4096
-_DUMMY_VEC_DIM  = 2
-_DUMMY_VEC_VAL  = [0.0, 0.0]
-
-# Message types whose content we keep verbatim
-_KEEP_FULL = {"human", "ai", "system"}
+_ID_LEN          = 256
+_SESSION_LEN     = 128
+_CHECKPOINT_LEN  = 128
+_DATA_LEN        = 65535
+_META_LEN        = 4096
+_SUMMARY_LEN     = 512
+_SUMMARY_PREVIEW = 100   # chars to keep from first user message as summary
+_DUMMY_VEC_DIM   = 2
+_DUMMY_VEC_VAL   = [0.0, 0.0]
+_KEEP_FULL       = {"human", "ai", "system"}
 
 
 # ── Checkpoint slimmer ──────────────────────────────────────────────────────────
 
 def _slim_checkpoint(checkpoint: dict) -> dict:
-    """
-    Return a copy of the checkpoint with ToolMessage content stripped.
-
-    LangGraph stores the full messages list in checkpoint["channel_values"]["messages"].
-    ToolMessages hold the raw tool output (RAG chunks, CVE JSON, IP data) which
-    can be tens of kilobytes per turn — these are not needed for conversation
-    continuity and are the primary cause of the 65,535-char overflow.
-
-    Strategy:
-      - HumanMessage / AIMessage / SystemMessage: kept verbatim
-      - ToolMessage / tool call result: content replaced with a 1-line summary
-      - All other checkpoint keys: copied as-is (channel versions, ts, etc.)
-    """
-    import copy
+    """Strip ToolMessage content before saving to keep size within VARCHAR(65535)."""
     slimmed = copy.deepcopy(checkpoint)
-
     channel_values = slimmed.get("channel_values", {})
     messages = channel_values.get("messages", [])
-
     slim_messages = []
     for msg in messages:
-        # LangGraph serialises messages as dicts with a "type" key
         if not isinstance(msg, dict):
             slim_messages.append(msg)
             continue
-
         msg_type = msg.get("type", "").lower()
-
         if msg_type in _KEEP_FULL:
             slim_messages.append(msg)
         else:
-            # tool / tool_call / function messages — strip the content
-            tool_name = (
-                msg.get("name")
-                or msg.get("tool_call_id", "unknown_tool")
-            )
-            slim_msg = {
-                k: v for k, v in msg.items()
-                if k not in ("content", "artifact")
-            }
+            tool_name = msg.get("name") or msg.get("tool_call_id", "unknown_tool")
+            slim_msg = {k: v for k, v in msg.items() if k not in ("content", "artifact")}
             slim_msg["content"] = f"[tool_result: {tool_name} (truncated for storage)]"
             slim_messages.append(slim_msg)
-
     channel_values["messages"] = slim_messages
     slimmed["channel_values"]  = channel_values
     return slimmed
@@ -148,20 +94,12 @@ def _slim_checkpoint(checkpoint: dict) -> dict:
 # ── Compression helpers ──────────────────────────────────────────────────────────
 
 def _compress(data: dict) -> str:
-    """
-    Serialise a dict to JSON, gzip-compress, then base64-encode.
-    Returns an ASCII string safe for Milvus VARCHAR storage.
-    """
     raw  = json.dumps(data, default=str).encode("utf-8")
-    comp = gzip.compress(raw, compresslevel=9)   # level 9 for max compression
+    comp = gzip.compress(raw, compresslevel=9)
     return base64.b64encode(comp).decode("ascii")
 
 
 def _decompress(blob: str) -> dict:
-    """
-    Reverse of _compress.  Also handles legacy uncompressed JSON for
-    backwards compatibility with records written before this version.
-    """
     if blob.startswith("{") or blob.startswith("["):
         return json.loads(blob)
     raw = gzip.decompress(base64.b64decode(blob))
@@ -170,63 +108,81 @@ def _decompress(blob: str) -> dict:
 
 # ── Collection bootstrap ────────────────────────────────────────────────────────
 
-def ensure_chat_history_collection(uri: str = MILVUS_URI) -> None:
-    """
-    Create the chat_history collection in Milvus if it does not exist.
-    Safe to call multiple times — idempotent.
-    """
-    client = MilvusClient(uri=uri)
-
-    if client.has_collection(COLLECTION_NAME):
-        print(f"✅ Collection '{COLLECTION_NAME}' already exists — skipping creation")
-        client.close()
+def _ensure_collection(
+    client: MilvusClient,
+    name: str,
+    build_schema,
+    build_index,
+    description: str = "",
+) -> None:
+    """Generic idempotent collection creator."""
+    if client.has_collection(name):
         return
-
     schema = client.create_schema(
         auto_id=False,
         enable_dynamic_field=False,
-        description="LangGraph conversation checkpoint store",
+        description=description,
     )
+    build_schema(schema)
+    index_params = client.prepare_index_params()
+    build_index(index_params)
+    client.create_collection(
+        collection_name=name,
+        schema=schema,
+        index_params=index_params,
+    )
+    print(f"✅ Created Milvus collection '{name}'")
 
-    schema.add_field(field_name="id",              datatype=DataType.VARCHAR, max_length=_ID_LEN,         is_primary=True)
+
+def _checkpoint_schema(schema):
+    schema.add_field(field_name="id",              datatype=DataType.VARCHAR, max_length=_ID_LEN,          is_primary=True)
     schema.add_field(field_name="session_id",      datatype=DataType.VARCHAR, max_length=_SESSION_LEN)
     schema.add_field(field_name="checkpoint_id",   datatype=DataType.VARCHAR, max_length=_CHECKPOINT_LEN)
     schema.add_field(field_name="parent_id",       datatype=DataType.VARCHAR, max_length=_CHECKPOINT_LEN)
     schema.add_field(field_name="checkpoint_data", datatype=DataType.VARCHAR, max_length=_DATA_LEN)
     schema.add_field(field_name="metadata",        datatype=DataType.VARCHAR, max_length=_META_LEN)
     schema.add_field(field_name="created_at",      datatype=DataType.INT64)
-    schema.add_field(
-        field_name="_vec",
-        datatype=DataType.FLOAT_VECTOR,
-        dim=_DUMMY_VEC_DIM,
-    )
+    schema.add_field(field_name="_vec",             datatype=DataType.FLOAT_VECTOR, dim=_DUMMY_VEC_DIM)
 
-    index_params = client.prepare_index_params()
+
+def _checkpoint_index(index_params):
     index_params.add_index(field_name="session_id", index_type="")
     index_params.add_index(field_name="_vec", index_type="FLAT", metric_type="L2")
 
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        schema=schema,
-        index_params=index_params,
-    )
-    print(f"✅ Created Milvus collection '{COLLECTION_NAME}'")
+
+def _session_schema(schema):
+    schema.add_field(field_name="session_id",  datatype=DataType.VARCHAR, max_length=_SESSION_LEN,  is_primary=True)
+    schema.add_field(field_name="summary",     datatype=DataType.VARCHAR, max_length=_SUMMARY_LEN)
+    schema.add_field(field_name="created_at",  datatype=DataType.INT64)
+    schema.add_field(field_name="updated_at",  datatype=DataType.INT64)
+    schema.add_field(field_name="_vec",        datatype=DataType.FLOAT_VECTOR, dim=_DUMMY_VEC_DIM)
+
+
+def _session_index(index_params):
+    index_params.add_index(field_name="_vec", index_type="FLAT", metric_type="L2")
+
+
+def ensure_collections(uri: str = MILVUS_URI) -> None:
+    """Idempotently create both collections."""
+    client = MilvusClient(uri=uri)
+    _ensure_collection(client, CHECKPOINT_COLLECTION, _checkpoint_schema, _checkpoint_index,
+                       "LangGraph conversation checkpoint store")
+    _ensure_collection(client, SESSION_COLLECTION, _session_schema, _session_index,
+                       "Session registry with summary")
     client.close()
 
 
 # ── Low-level chat store ────────────────────────────────────────────────────────
 
 class MilvusChatStore:
-    """
-    Thin wrapper around MilvusClient for reading/writing checkpoint records.
-    """
-
     def __init__(self, uri: str = MILVUS_URI):
-        ensure_chat_history_collection(uri)
+        ensure_collections(uri)
         self.client = MilvusClient(uri=uri)
 
     def close(self):
         self.client.close()
+
+    # ── Checkpoint CRUD ────────────────────────────────────────────────────────────
 
     def save(
         self,
@@ -236,28 +192,20 @@ class MilvusChatStore:
         checkpoint_data: dict,
         metadata: dict,
     ) -> None:
-        """
-        Slim the checkpoint (strip tool message content), then compress and upsert.
-        """
         slimmed    = _slim_checkpoint(checkpoint_data)
         compressed = _compress(slimmed)
-
         if len(compressed) > _DATA_LEN:
-            # Extremely long AI responses can still overflow after slimming.
-            # Fall back gracefully: conversation continues in memory.
             logger.warning(
                 "Checkpoint %s too large even after slimming+compression "
                 "(%d chars > %d). Skipping Milvus persistence for this turn.",
                 checkpoint_id, len(compressed), _DATA_LEN,
             )
             return
-
         meta_str = json.dumps(metadata, default=str)
         if len(meta_str) > _META_LEN:
             meta_str = meta_str[:_META_LEN - 3] + "..."
-
         self.client.upsert(
-            collection_name=COLLECTION_NAME,
+            collection_name=CHECKPOINT_COLLECTION,
             data=[{
                 "id":              f"{session_id}_{checkpoint_id}",
                 "session_id":      session_id,
@@ -272,12 +220,10 @@ class MilvusChatStore:
 
     def get_latest(self, session_id: str) -> Optional[dict]:
         results = self.client.query(
-            collection_name=COLLECTION_NAME,
+            collection_name=CHECKPOINT_COLLECTION,
             filter=f'session_id == "{session_id}"',
-            output_fields=[
-                "id", "session_id", "checkpoint_id",
-                "parent_id", "checkpoint_data", "metadata", "created_at",
-            ],
+            output_fields=["id", "session_id", "checkpoint_id", "parent_id",
+                           "checkpoint_data", "metadata", "created_at"],
         )
         if not results:
             return None
@@ -285,14 +231,11 @@ class MilvusChatStore:
         return self._deserialise(latest)
 
     def get_by_checkpoint_id(self, session_id: str, checkpoint_id: str) -> Optional[dict]:
-        record_id = f"{session_id}_{checkpoint_id}"
         results = self.client.get(
-            collection_name=COLLECTION_NAME,
-            ids=[record_id],
-            output_fields=[
-                "id", "session_id", "checkpoint_id",
-                "parent_id", "checkpoint_data", "metadata", "created_at",
-            ],
+            collection_name=CHECKPOINT_COLLECTION,
+            ids=[f"{session_id}_{checkpoint_id}"],
+            output_fields=["id", "session_id", "checkpoint_id", "parent_id",
+                           "checkpoint_data", "metadata", "created_at"],
         )
         if not results:
             return None
@@ -300,25 +243,29 @@ class MilvusChatStore:
 
     def list_checkpoints(self, session_id: str) -> list[dict]:
         results = self.client.query(
-            collection_name=COLLECTION_NAME,
+            collection_name=CHECKPOINT_COLLECTION,
             filter=f'session_id == "{session_id}"',
-            output_fields=[
-                "id", "session_id", "checkpoint_id",
-                "parent_id", "checkpoint_data", "metadata", "created_at",
-            ],
+            output_fields=["id", "session_id", "checkpoint_id", "parent_id",
+                           "checkpoint_data", "metadata", "created_at"],
         )
         records = [self._deserialise(r) for r in results]
         return sorted(records, key=lambda r: r["created_at"], reverse=True)
 
     def delete_session(self, session_id: str) -> int:
+        # Delete checkpoints
         results = self.client.query(
-            collection_name=COLLECTION_NAME,
+            collection_name=CHECKPOINT_COLLECTION,
             filter=f'session_id == "{session_id}"',
             output_fields=["id"],
         )
         ids = [r["id"] for r in results]
         if ids:
-            self.client.delete(collection_name=COLLECTION_NAME, ids=ids)
+            self.client.delete(collection_name=CHECKPOINT_COLLECTION, ids=ids)
+        # Delete session registry entry
+        try:
+            self.client.delete(collection_name=SESSION_COLLECTION, ids=[session_id])
+        except Exception:
+            pass
         return len(ids)
 
     @staticmethod
@@ -327,15 +274,45 @@ class MilvusChatStore:
         record["metadata"]        = json.loads(record["metadata"])
         return record
 
+    # ── Session registry CRUD ───────────────────────────────────────────────────────
+
+    def upsert_session(self, session_id: str, summary: str) -> None:
+        """Create or update a session registry entry."""
+        now = int(time.time() * 1000)
+        # Check if exists to preserve created_at
+        existing = self.client.get(
+            collection_name=SESSION_COLLECTION,
+            ids=[session_id],
+            output_fields=["session_id", "created_at"],
+        )
+        created_at = existing[0]["created_at"] if existing else now
+        self.client.upsert(
+            collection_name=SESSION_COLLECTION,
+            data=[{
+                "session_id": session_id,
+                "summary":    summary[:_SUMMARY_LEN],
+                "created_at": created_at,
+                "updated_at": now,
+                "_vec":       _DUMMY_VEC_VAL,
+            }],
+        )
+
+    def list_sessions(self) -> list[dict]:
+        """Return all sessions sorted newest-first."""
+        try:
+            results = self.client.query(
+                collection_name=SESSION_COLLECTION,
+                filter="session_id != ''",
+                output_fields=["session_id", "summary", "created_at", "updated_at"],
+            )
+        except Exception:
+            return []
+        return sorted(results, key=lambda r: r.get("updated_at", 0), reverse=True)
+
 
 # ── LangGraph checkpointer ────────────────────────────────────────────────────────
 
 class MilvusCheckpointer(BaseCheckpointSaver):
-    """
-    LangGraph-compatible checkpoint saver backed by Milvus.
-    Plug directly into graph.compile(checkpointer=MilvusCheckpointer()).
-    """
-
     def __init__(self, uri: str = MILVUS_URI):
         super().__init__()
         self.store = MilvusChatStore(uri=uri)
@@ -410,8 +387,6 @@ class MilvusCheckpointer(BaseCheckpointSaver):
     ) -> None:
         pass
 
-    # ── Async variants ────────────────────────────────────────────────────────────────
-
     async def aget_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
         return self.get_tuple(config)
 
@@ -440,13 +415,18 @@ class MilvusCheckpointer(BaseCheckpointSaver):
     ) -> None:
         pass
 
-    # ── Utility ───────────────────────────────────────────────────────────────────
-
     def clear_session(self, session_id: str) -> int:
-        """Delete all history for a session (New Chat). Returns count deleted."""
         deleted = self.store.delete_session(session_id)
         print(f"🗑️  Cleared {deleted} checkpoints for session {session_id!r}")
         return deleted
+
+    def register_session(self, session_id: str, summary: str) -> None:
+        """Upsert a session registry entry (called on first user message)."""
+        self.store.upsert_session(session_id, summary)
+
+    def list_sessions(self) -> list[dict]:
+        """Return all sessions from the registry."""
+        return self.store.list_sessions()
 
     def close(self):
         self.store.close()

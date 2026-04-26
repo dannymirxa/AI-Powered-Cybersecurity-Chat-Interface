@@ -1,39 +1,15 @@
 """
 supervisor_agent.py
 ───────────────────
-LangGraph multi-agent supervisor for the AI Cybersecurity Chat Interface.
+LangGraph multi-agent supervisor.
 
-Architecture:
-                        ┌─────────────────┐
-                        │   SUPERVISOR    │  ← SUPERVISOR_MODEL (default: qwen2.5:3b)
-                        │  (orchestrator) │
-                        └────────┬────────┘
-                 ┌───────────┼───────────────┐
-                 │               │               │
-          ┌────────────┐  ┌────────────┐  ┌────────────┐
-          │ rag_agent  │  │threat_agent│  │audit_agent │
-          │AGENT_MODEL │  │AGENT_MODEL │  │AGENT_MODEL │
-          └────────────┘  └────────────┘  └────────────┘
-                                │
-                        MCP Tool Server
-                    (mcp_rag_server.py via stdio)
+stream() now uses stream_mode="updates" instead of "values" so each step
+yields only the delta from that node — not the full accumulated state.
+This fixes the bug where the previous turn’s answer re-appeared at the
+start of every new response.
 
-Model env vars (all optional — defaults shown):
-  SUPERVISOR_MODEL   qwen2.5:3b   orchestrator / router
-  AGENT_MODEL        qwen2.5:3b   all three sub-agents
-
-MultiServerMCPClient version note (langchain-mcp-adapters ≥0.1.0):
-  The context-manager API (`async with client`) was removed in v0.1.0.
-  The correct pattern is now simply:
-
-      client = MultiServerMCPClient(config)
-      tools  = await client.get_tools()   # no __aenter__ needed
-
-  The client manages its own internal sessions.
-  We no longer need to keep a reference to it after startup because the
-  tools list (bound LangChain tool objects) is all that the agents need.
-  api.py still receives a client object for the shutdown hook, but
-  closing it is now a no-op (nothing to tear down).
+stream() also yields agent-routing SSE events so the UI can show which
+specialist agent is being called.
 """
 
 import os
@@ -66,7 +42,12 @@ MCP_ENV = {
     if k in os.environ
 }
 
-# ── Supervisor system prompt ─────────────────────────────────────────────────────
+# Maps LangGraph node name → human-readable label emitted in SSE agent events
+AGENT_LABELS = {
+    "rag_agent":    "📚 NIST / Framework Q&A",
+    "threat_agent": "🔍 CVE / Threat Analysis",
+    "audit_agent":  "🔑 Credential Audit",
+}
 
 SUPERVISOR_PROMPT = """You are the Cybersecurity AI Supervisor coordinating a team
 of specialised security agents. Your role is to:
@@ -98,16 +79,8 @@ Scope enforcement:
 Always present the final answer in a structured, readable format.
 """
 
-# ── Graph builder ────────────────────────────────────────────────────────────────
 
 async def build_supervisor_graph():
-    """
-    Build and compile the LangGraph supervisor.
-
-    Returns (graph, client) where client is a MultiServerMCPClient instance.
-    In langchain-mcp-adapters >=0.1.0 the client no longer requires a context
-    manager — get_tools() can be called directly after construction.
-    """
     mcp_config = {
         "cybersec_tools": {
             "command":   sys.executable,
@@ -117,17 +90,14 @@ async def build_supervisor_graph():
         }
     }
 
-    # langchain-mcp-adapters >=0.1.0: call get_tools() directly, no __aenter__
     client = MultiServerMCPClient(mcp_config)
     tools  = await client.get_tools()
     print(f"✅ Loaded {len(tools)} MCP tools: {[t.name for t in tools]}")
 
-    # ── Specialist agents ─────────────────────────────────────────────────────────────
     rag_agent    = create_rag_agent(tools)
     threat_agent = create_threat_agent(tools)
     audit_agent  = create_audit_agent(tools)
 
-    # ── Supervisor LLM ─────────────────────────────────────────────────────────────
     supervisor_llm = ChatOllama(
         model=SUPERVISOR_MODEL,
         base_url=OLLAMA_BASE_URL,
@@ -136,10 +106,8 @@ async def build_supervisor_graph():
     )
     print(f"✅ Supervisor model: {SUPERVISOR_MODEL}")
 
-    # ── Checkpointer ────────────────────────────────────────────────────────────────
     checkpointer = MilvusCheckpointer()
 
-    # ── Compile ───────────────────────────────────────────────────────────────────
     workflow = create_supervisor(
         agents=[rag_agent, threat_agent, audit_agent],
         model=supervisor_llm,
@@ -149,56 +117,58 @@ async def build_supervisor_graph():
     return graph, client
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
 def _thread_config(session_id: str) -> dict:
     return {"configurable": {"thread_id": session_id}}
 
 
-async def invoke(graph, messages: list[dict], session_id: str) -> dict:
-    return await graph.ainvoke(
-        {"messages": messages},
-        config=_thread_config(session_id),
-    )
-
-
 async def stream(graph, messages: list[dict], session_id: str):
     """
-    Async generator — yields incremental text chunks from the supervisor's
-    final AIMessage only.
+    Async generator that yields either:
+
+      ("agent", label)   — emitted ONCE when a specialist agent node activates
+      ("text",  chunk)   — incremental supervisor answer text
+
+    Uses stream_mode="updates" so each step delta is independent.
+    This fixes the bug where stream_mode="values" replayed the full accumulated
+    state including the previous turn’s answer on every new message.
     """
-    SUB_AGENTS = {"rag_agent", "threat_agent", "audit_agent"}
+    announced_agents: set[str] = set()
+    supervisor_answer = ""
 
-    last_ai_content = ""
-    seen_content    = ""
-
-    async for state in graph.astream(
+    async for step in graph.astream(
         {"messages": messages},
         config=_thread_config(session_id),
-        stream_mode="values",
+        stream_mode="updates",
     ):
-        msgs = state.get("messages", [])
+        for node_name, node_state in step.items():
+            # ── Agent routing indicator ─────────────────────────────────────
+            if node_name in AGENT_LABELS and node_name not in announced_agents:
+                announced_agents.add(node_name)
+                yield ("agent", AGENT_LABELS[node_name])
 
-        for msg in reversed(msgs):
-            if not isinstance(msg, AIMessage):
-                continue
-            sender = getattr(msg, "name", None) or ""
-            if sender in SUB_AGENTS:
-                continue
-            content = msg.content or ""
-            if isinstance(content, list):
-                content = "".join(
-                    c.get("text", "") if isinstance(c, dict) else str(c)
-                    for c in content
-                )
-            last_ai_content = content
-            break
-
-        if last_ai_content and last_ai_content != seen_content:
-            delta = last_ai_content[len(seen_content):]
-            if delta:
-                yield delta
-            seen_content = last_ai_content
+            # ── Supervisor final answer ─────────────────────────────────────
+            # The supervisor node name in langgraph_supervisor is "supervisor"
+            if node_name == "supervisor":
+                msgs = node_state.get("messages", [])
+                for msg in reversed(msgs):
+                    if not isinstance(msg, AIMessage):
+                        continue
+                    sender = getattr(msg, "name", None) or ""
+                    if sender in AGENT_LABELS:
+                        continue
+                    content = msg.content or ""
+                    if isinstance(content, list):
+                        content = "".join(
+                            c.get("text", "") if isinstance(c, dict) else str(c)
+                            for c in content
+                        )
+                    # Only yield NEW content (delta since last supervisor step)
+                    if content and content != supervisor_answer:
+                        delta = content[len(supervisor_answer):]
+                        if delta:
+                            yield ("text", delta)
+                        supervisor_answer = content
+                    break
 
 
 async def get_history(graph, session_id: str) -> list:
