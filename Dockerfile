@@ -3,7 +3,7 @@
 # Runs both the FastAPI backend (api.py) and the Streamlit UI (ui.py).
 # Ollama and Milvus are separate services defined in docker-compose.yaml.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
