@@ -3,7 +3,7 @@
 #
 # Services:
 #   app        — FastAPI backend + Streamlit UI
-#   ollama     — Local LLM server (ministral:8b + nomic-embed-text)
+#   ollama     — Local LLM server (ministral-3:8b + nomic-embed-text)
 #   etcd       — Milvus metadata store
 #   minio      — Milvus object storage
 #   milvus     — Vector + scalar database
@@ -56,8 +56,8 @@ services:
       - ollama_data:/root/.ollama
     entrypoint: >
       /bin/sh -c "
-        echo 'Pulling ${SUPERVISOR_MODEL:-ministral:8b} ...' &&
-        ollama pull ${SUPERVISOR_MODEL:-ministral:8b} &&
+        echo 'Pulling ${SUPERVISOR_MODEL:-ministral-3:8b} ...' &&
+        ollama pull ${SUPERVISOR_MODEL:-ministral-3:8b} &&
         echo 'Pulling ${EMBED_MODEL:-nomic-embed-text} ...' &&
         ollama pull ${EMBED_MODEL:-nomic-embed-text} &&
         echo 'All models ready.'

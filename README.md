@@ -131,8 +131,8 @@ All configuration is via environment variables. Copy `.env.example` → `.env` a
 |---|---|---|
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API base URL *(auto-overridden in Docker)* |
 | `OLLAMA_PORT` | `11434` | Host port Ollama is exposed on |
-| `SUPERVISOR_MODEL` | `ministral:8b` | LLM used by the supervisor node |
-| `AGENT_MODEL` | `ministral:8b` | LLM used by the three specialist agents |
+| `SUPERVISOR_MODEL` | `ministral-3:8b` | LLM used by the supervisor node |
+| `AGENT_MODEL` | `ministral-3:8b` | LLM used by the three specialist agents |
 | `EMBED_MODEL` | `nomic-embed-text` | Embedding model for RAG vector search |
 | `SUPERVISOR_TEMPERATURE` | `0` | Supervisor LLM temperature |
 | `SUPERVISOR_CTX` | `4096` | Supervisor context window (tokens) |
@@ -259,7 +259,7 @@ docker compose up -d etcd minio milvus
 
 # Start Ollama locally
 ollama serve &
-ollama pull ministral:8b
+ollama pull ministral-3:8b
 ollama pull nomic-embed-text
 
 # Start backend and UI

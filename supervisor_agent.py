@@ -25,7 +25,7 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL  = os.getenv("OLLAMA_URL",        "http://localhost:11434")
-SUPERVISOR_MODEL = os.getenv("SUPERVISOR_MODEL",  "ministral:8b")
+SUPERVISOR_MODEL = os.getenv("SUPERVISOR_MODEL",  "ministral-3:8b")
 SUPERVISOR_TEMP  = float(os.getenv("SUPERVISOR_TEMPERATURE", "0"))
 SUPERVISOR_CTX   = int(os.getenv("SUPERVISOR_CTX",           "4096"))
 HISTORY_LIMIT    = int(os.getenv("HISTORY_LIMIT",            "6"))   # turns to inject
