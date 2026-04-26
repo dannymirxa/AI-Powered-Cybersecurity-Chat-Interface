@@ -1,11 +1,10 @@
 """
-rag_agent.py
-────────────
+agents/rag_agent.py
+───────────────────
 Specialised agent: answers questions grounded in the cybersecurity
 knowledge base (NIST CSF 2.0 docs stored in Milvus).
 
-All model names, URLs, and tuning parameters are read from environment
-variables — see .env.example for the full list.
+Tool used: search_knowledge_base
 """
 
 import os
@@ -16,10 +15,10 @@ from langchain.agents import create_agent
 
 load_dotenv()
 
-AGENT_MODEL      = os.getenv("AGENT_MODEL",   "qwen2.5:3b")
-OLLAMA_BASE_URL  = os.getenv("OLLAMA_URL",    "http://localhost:11434")
-AGENT_TEMP       = float(os.getenv("AGENT_TEMPERATURE", "0.1"))
-AGENT_CTX        = int(os.getenv("AGENT_CTX",           "4096"))
+AGENT_MODEL     = os.getenv("AGENT_MODEL",        "ministral-3:8b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_URL",         "http://localhost:11434")
+AGENT_TEMP      = float(os.getenv("AGENT_TEMPERATURE", "0.1"))
+AGENT_CTX       = int(os.getenv("AGENT_CTX",           "4096"))
 
 SYSTEM_PROMPT = """You are a Cybersecurity Knowledge Expert specialised in the
 NIST Cybersecurity Framework 2.0, risk management, and security best practices.

@@ -1,12 +1,11 @@
 """
-audit_agent.py
-──────────────
+agents/audit_agent.py
+─────────────────────
 Specialised agent: security audit & credential hygiene.
   - Password breach checks via HIBP (k-anonymity, no plaintext sent)
   - Policy recommendations based on breach results
 
-All model names, URLs, and tuning parameters are read from environment
-variables — see .env.example for the full list.
+Tool used: check_breach
 """
 
 import os
@@ -17,10 +16,10 @@ from langchain.agents import create_agent
 
 load_dotenv()
 
-AGENT_MODEL      = os.getenv("AGENT_MODEL",   "qwen2.5:3b")
-OLLAMA_BASE_URL  = os.getenv("OLLAMA_URL",    "http://localhost:11434")
-AGENT_TEMP       = float(os.getenv("AGENT_TEMPERATURE", "0.1"))
-AGENT_CTX        = int(os.getenv("AGENT_CTX",           "4096"))
+AGENT_MODEL     = os.getenv("AGENT_MODEL",        "ministral-3:8b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_URL",         "http://localhost:11434")
+AGENT_TEMP      = float(os.getenv("AGENT_TEMPERATURE", "0.1"))
+AGENT_CTX       = int(os.getenv("AGENT_CTX",           "4096"))
 
 SYSTEM_PROMPT = """You are a Security Auditor specialised in credential hygiene
 and access control policy.
