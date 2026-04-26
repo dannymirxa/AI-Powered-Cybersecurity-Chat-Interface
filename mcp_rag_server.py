@@ -1,29 +1,29 @@
 """
 mcp_rag_server.py
 ─────────────────
-MCP server exposing all 4 cybersecurity tools to any MCP-compatible client.
+MCP server exposing all 5 cybersecurity tools to any MCP-compatible client.
 
 Tools exposed:
-  1. search_knowledge_base  — RAG semantic search over Milvus
-  2. lookup_cve             — CVE details from NIST NVD
-  3. check_ip               — IP abuse score from AbuseIPDB
-  4. check_breach           — Pwned password check via HIBP
+  1. search_knowledge_base     — RAG semantic search over Milvus
+  2. lookup_cve                — CVE details from NIST NVD
+  3. check_ip                  — IP abuse score from AbuseIPDB
+  4. check_breach              — Pwned password check via HIBP
+  5. get_conversation_history  — Fetch recent chat turns from Milvus chat_memory
 
 Run:
   python mcp_rag_server.py           # stdio transport (LangGraph / Claude Desktop)
   python mcp_rag_server.py --sse     # SSE transport (HTTP-based MCP clients)
 
-Change from previous version:
-  The Milvus connection is now opened LAZILY inside each search_knowledge_base
-  call rather than eagerly in the server lifespan.  This means the MCP subprocess
-  starts instantly and reports its tools to the parent process without waiting
-  for Milvus to be available, which was the cause of the startup hang in FastAPI.
+Note:
+  The Milvus connection is opened LAZILY inside each tool call.
+  This means the MCP subprocess starts instantly without waiting for Milvus.
 """
 
 import argparse
 
 from mcp.server.fastmcp import FastMCP
 
+from agents.chat_memory import get_recent_messages
 from tools.rag_tool import (
     search_cybersec_kb,
     cve_lookup,
@@ -31,9 +31,6 @@ from tools.rag_tool import (
     check_password_breach,
 )
 
-# ── MCP Server ────────────────────────────────────────────────────────────
-# No lifespan — Milvus client is created and closed inside each tool call.
-# This lets the subprocess start immediately without waiting for Milvus.
 mcp = FastMCP(
     "CyberSec Tools",
     dependencies=["pymilvus", "requests"],
@@ -69,12 +66,11 @@ def search_knowledge_base(
     Returns:
         {"query": str, "results": [{text, source, chunk_index, score}, ...]}
     """
-    # Milvus client opened and closed per call — no shared connection needed
     return search_cybersec_kb(
         query=query,
         top_k=top_k,
         score_threshold=score_threshold,
-        client=None,   # search_cybersec_kb creates its own client when None
+        client=None,
     )
 
 
@@ -170,7 +166,30 @@ def check_breach(password: str) -> dict:
     return check_password_breach(password=password)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tool 5 — Conversation History
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def get_conversation_history(session_id: str, limit: int = 6) -> dict:
+    """
+    Return the latest messages for a session from Milvus chat_memory.
+    Useful for agents that need explicit access to prior conversation context.
+
+    Args:
+        session_id: The session identifier.
+        limit:      Number of most recent messages to return (default 6).
+
+    Returns:
+        {"session_id": str, "messages": [{role, content, created_at}, ...]}
+    """
+    return {
+        "session_id": session_id,
+        "messages":   get_recent_messages(session_id, limit=limit),
+    }
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CyberSec MCP Tool Server")
