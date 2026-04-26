@@ -17,6 +17,14 @@ What is tested:
   6. Multi-turn memory    — follow-up refers to prior turn (core memory test)
   7. Off-topic rejection  — non-cybersecurity question is declined
   8. Empty input guard    — empty string handled gracefully
+
+NOTE on stream() API
+--------------------
+stream() yields (kind, value) tuples:
+  ("agent", label)  — which specialist agent / tool is being used
+  ("text",  chunk)  — incremental answer text
+
+The helpers below unpack these tuples correctly.
 """
 
 import asyncio
@@ -26,10 +34,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from supervisor_agent import build_supervisor_graph, invoke, stream
+from supervisor_agent import build_supervisor_graph, stream
 
 
-# ── ANSI colours ───────────────────────────────────────────────────────────────
+# ── ANSI colours ─────────────────────────────────────────────────────────────────
 GREEN  = "\033[92m"
 RED    = "\033[91m"
 YELLOW = "\033[93m"
@@ -52,7 +60,40 @@ def sub(msg):
     print(f"\n{BOLD}{CYAN}\u25b6 {msg}{RESET}")
 
 
-# ── Test case definition ──────────────────────────────────────────────────────
+# ── Helper: collect full text + agent labels from stream() ──────────────────
+
+async def collect_stream(
+    graph,
+    messages: list[dict],
+    session_id: str,
+    print_live: bool = True,
+) -> tuple[str, list[str]]:
+    """
+    Drain stream() and return (full_text, agent_labels_seen).
+
+    stream() yields (kind, value) tuples:
+      ("agent", label)  — printed inline as a dim indicator
+      ("text",  chunk)  — accumulated into full_text and printed live
+    """
+    full_text: str       = ""
+    agents_seen: list[str] = []
+
+    async for kind, value in stream(graph, messages, session_id):
+        if kind == "agent":
+            if value not in agents_seen:
+                agents_seen.append(value)
+            if print_live:
+                print(f"\n    {YELLOW}[tool] {value}{RESET}")
+                print(f"    {BOLD}[ASSISTANT]{RESET} ", end="", flush=True)
+        elif kind == "text":
+            full_text += value
+            if print_live:
+                print(value, end="", flush=True)
+
+    return full_text, agents_seen
+
+
+# ── Test case definition ───────────────────────────────────────────────────────
 
 @dataclass
 class TestCase:
@@ -62,11 +103,12 @@ class TestCase:
     turns:            list[tuple[str, str]]   # (role, content)
     must_contain:     list[str] = field(default_factory=list)
     must_not_contain: list[str] = field(default_factory=list)
+    must_use_tool:    list[str] = field(default_factory=list)  # expected agent labels
     shared_session:   bool = False            # True = all turns share one session_id
 
 
 TEST_CASES = [
-    # ── 1. RAG routing ──────────────────────────────────────────────────
+    # ── 1. RAG routing ────────────────────────────────────────────────────────
     TestCase(
         number=1,
         name="RAG Routing",
@@ -75,9 +117,10 @@ TEST_CASES = [
             ("user", "What does NIST CSF 2.0 say about incident recovery planning?")
         ],
         must_contain=["nist", "recover"],
+        must_use_tool=["\U0001f4da NIST / Framework Q&A"],
     ),
 
-    # ── 2. CVE routing ──────────────────────────────────────────────────
+    # ── 2. CVE routing ────────────────────────────────────────────────────────
     TestCase(
         number=2,
         name="CVE Lookup Routing",
@@ -86,9 +129,10 @@ TEST_CASES = [
             ("user", "What is CVE-2021-44228 and how severe is it?")
         ],
         must_contain=["cve-2021-44228", "log4"],
+        must_use_tool=["\U0001f50d CVE lookup"],
     ),
 
-    # ── 3. IP reputation routing ─────────────────────────────────────────
+    # ── 3. IP reputation routing ───────────────────────────────────────────────
     TestCase(
         number=3,
         name="IP Reputation Routing",
@@ -97,9 +141,10 @@ TEST_CASES = [
             ("user", "Can you check if the IP address 185.220.101.1 is malicious?")
         ],
         must_contain=["185.220.101.1"],
+        must_use_tool=["\U0001f310 IP reputation check"],
     ),
 
-    # ── 4. Password audit routing ─────────────────────────────────────────
+    # ── 4. Password audit routing ───────────────────────────────────────────────
     TestCase(
         number=4,
         name="Password Breach Routing",
@@ -108,9 +153,10 @@ TEST_CASES = [
             ("user", "Has the password 'password123' appeared in any data breaches?")
         ],
         must_contain=["breach", "password"],
+        must_use_tool=["\U0001f511 Password breach check"],
     ),
 
-    # ── 5. Multi-agent chaining ──────────────────────────────────────────
+    # ── 5. Multi-agent chaining ───────────────────────────────────────────────
     TestCase(
         number=5,
         name="Multi-Agent Chain (CVE + Framework)",
@@ -123,7 +169,7 @@ TEST_CASES = [
         must_contain=["cve-2023-23397", "nist"],
     ),
 
-    # ── 6. Multi-turn memory ───────────────────────────────────────────
+    # ── 6. Multi-turn memory ───────────────────────────────────────────────
     TestCase(
         number=6,
         name="Multi-Turn Conversation Memory",
@@ -137,7 +183,7 @@ TEST_CASES = [
         must_contain=["govern", "identify"],
     ),
 
-    # ── 7. Off-topic rejection ──────────────────────────────────────────
+    # ── 7. Off-topic rejection ────────────────────────────────────────────────
     TestCase(
         number=7,
         name="Off-Topic Rejection",
@@ -148,7 +194,7 @@ TEST_CASES = [
         must_not_contain=["coconut milk", "pandan", "sambal"],
     ),
 
-    # ── 8. Empty input guard ──────────────────────────────────────────
+    # ── 8. Empty input guard ────────────────────────────────────────────────
     TestCase(
         number=8,
         name="Empty Input Guard",
@@ -160,7 +206,7 @@ TEST_CASES = [
 ]
 
 
-# ── Test runner ──────────────────────────────────────────────────────────────
+# ── Test runner ──────────────────────────────────────────────────────────────────
 
 async def run_test(graph, test: TestCase) -> bool:
     """
@@ -172,41 +218,40 @@ async def run_test(graph, test: TestCase) -> bool:
 
     session_id = str(uuid.uuid4())
     last_response = ""
+    all_agents_seen: list[str] = []
     passed = True
 
     try:
         if test.shared_session:
-            for role, content in test.turns:
+            for i, (role, content) in enumerate(test.turns):
                 print(f"\n    {BOLD}[USER]{RESET} {content.strip()}")
                 print(f"    {BOLD}[ASSISTANT]{RESET} ", end="", flush=True)
-                last_response = ""
-                async for chunk in stream(
+                last_response, agents = await collect_stream(
                     graph,
                     [{"role": role, "content": content.strip()}],
                     session_id=session_id,
-                ):
-                    print(chunk, end="", flush=True)
-                    last_response += chunk
+                    print_live=True,
+                )
+                all_agents_seen.extend(a for a in agents if a not in all_agents_seen)
                 print()
         else:
             for role, content in test.turns:
                 print(f"    {BOLD}[USER]{RESET} {content.strip()}")
                 print(f"    {BOLD}[ASSISTANT]{RESET} ", end="", flush=True)
-                last_response = ""
-                async for chunk in stream(
+                last_response, agents = await collect_stream(
                     graph,
                     [{"role": role, "content": content.strip()}],
                     session_id=session_id,
-                ):
-                    print(chunk, end="", flush=True)
-                    last_response += chunk
+                    print_live=True,
+                )
+                all_agents_seen.extend(a for a in agents if a not in all_agents_seen)
                 print()
 
     except Exception as exc:
         fail(f"Exception raised: {exc}")
         return False
 
-    # ── Assertions ──────────────────────────────────────────────────────
+    # ── Assertions ───────────────────────────────────────────────────────────────
     response_lower = last_response.lower()
 
     if test.must_contain:
@@ -225,7 +270,15 @@ async def run_test(graph, test: TestCase) -> bool:
                 fail(f"Should NOT contain: '{keyword}'")
                 passed = False
 
-    if not test.must_contain and not test.must_not_contain:
+    if test.must_use_tool:
+        for expected_label in test.must_use_tool:
+            if expected_label in all_agents_seen:
+                ok(f"Correct tool used: '{expected_label}'")
+            else:
+                fail(f"Expected tool NOT used: '{expected_label}' (got: {all_agents_seen})")
+                passed = False
+
+    if not test.must_contain and not test.must_not_contain and not test.must_use_tool:
         if last_response.strip():
             ok("Returned a non-empty response (no crash)")
         else:
@@ -248,8 +301,6 @@ async def run_all_tests(test_numbers: Optional[list[int]] = None):
 
     results = {}
 
-    # build_supervisor_graph() is now a plain async function, not a context
-    # manager — it returns (graph, client). Keep both alive for all tests.
     graph, client = await build_supervisor_graph()
 
     try:
@@ -258,11 +309,9 @@ async def run_all_tests(test_numbers: Optional[list[int]] = None):
             results[test.number] = (test.name, passed)
             print()
     finally:
-        # client holds the MCP subprocess — nothing explicit needed,
-        # the subprocess exits when Python process ends, but be explicit.
         pass
 
-    # ── Summary ──────────────────────────────────────────────────────
+    # ── Summary ─────────────────────────────────────────────────────────────────
     header("Results Summary")
     total  = len(results)
     n_pass = sum(1 for _, (_, p) in results.items() if p)
@@ -309,12 +358,15 @@ async def interactive_chat():
 
         print(f"\n{BOLD}Assistant:{RESET} ", end="", flush=True)
         try:
-            async for chunk in stream(
+            async for kind, value in stream(
                 graph,
                 [{"role": "user", "content": user_input}],
                 session_id=session_id,
             ):
-                print(chunk, end="", flush=True)
+                if kind == "agent":
+                    print(f"\n  {YELLOW}[tool] {value}{RESET}\n", flush=True)
+                elif kind == "text":
+                    print(value, end="", flush=True)
         except Exception as exc:
             print(f"\n{RED}Error: {exc}{RESET}")
         print()
