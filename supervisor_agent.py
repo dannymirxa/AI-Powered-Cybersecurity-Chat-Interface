@@ -22,13 +22,18 @@ Model env vars (all optional — defaults shown):
   SUPERVISOR_MODEL   qwen2.5:3b   orchestrator / router
   AGENT_MODEL        qwen2.5:3b   all three sub-agents
 
-Key design decision — MCP client lifecycle:
-  MultiServerMCPClient must be used as an async context manager
-  (`async with client`) before get_tools() can be called.  We enter the
-  context once at startup (inside build_supervisor_graph) and keep it open
-  for the lifetime of the FastAPI process, closing it only in the lifespan
-  shutdown hook.  The caller receives both the compiled graph and the
-  live client so it can close it properly.
+MultiServerMCPClient version note (langchain-mcp-adapters ≥0.1.0):
+  The context-manager API (`async with client`) was removed in v0.1.0.
+  The correct pattern is now simply:
+
+      client = MultiServerMCPClient(config)
+      tools  = await client.get_tools()   # no __aenter__ needed
+
+  The client manages its own internal sessions.
+  We no longer need to keep a reference to it after startup because the
+  tools list (bound LangChain tool objects) is all that the agents need.
+  api.py still receives a client object for the shutdown hook, but
+  closing it is now a no-op (nothing to tear down).
 """
 
 import os
@@ -99,29 +104,22 @@ async def build_supervisor_graph():
     """
     Build and compile the LangGraph supervisor.
 
-    Returns (graph, mcp_client) where mcp_client is the already-entered
-    async context manager.  The caller MUST call
-    `await mcp_client.__aexit__(None, None, None)` on shutdown.
-
-    Root cause of the original startup hang:
-      MultiServerMCPClient.get_tools() only works AFTER the client context
-      has been entered (async with client).  Previously the code called
-      get_tools() on an unentered client, which blocked indefinitely.
-      We now enter the context first, then fetch tools.
+    Returns (graph, client) where client is a MultiServerMCPClient instance.
+    In langchain-mcp-adapters >=0.1.0 the client no longer requires a context
+    manager — get_tools() can be called directly after construction.
     """
     mcp_config = {
         "cybersec_tools": {
-            "command": sys.executable,
-            "args":    [MCP_SERVER_PATH],
+            "command":   sys.executable,
+            "args":      [MCP_SERVER_PATH],
             "transport": "stdio",
-            "env": MCP_ENV if MCP_ENV else None,
+            "env":       MCP_ENV if MCP_ENV else None,
         }
     }
 
-    # ── Enter the MCP client context FIRST, THEN get tools ────────────────────
+    # langchain-mcp-adapters >=0.1.0: call get_tools() directly, no __aenter__
     client = MultiServerMCPClient(mcp_config)
-    await client.__aenter__()          # starts the stdio subprocess
-    tools  = await client.get_tools()  # now safe to call
+    tools  = await client.get_tools()
     print(f"✅ Loaded {len(tools)} MCP tools: {[t.name for t in tools]}")
 
     # ── Specialist agents ─────────────────────────────────────────────────────────────
@@ -168,9 +166,6 @@ async def stream(graph, messages: list[dict], session_id: str):
     """
     Async generator — yields incremental text chunks from the supervisor's
     final AIMessage only.
-
-    Only yields content from proper AIMessage instances that come from the
-    supervisor node (not sub-agents).
     """
     SUB_AGENTS = {"rag_agent", "threat_agent", "audit_agent"}
 
