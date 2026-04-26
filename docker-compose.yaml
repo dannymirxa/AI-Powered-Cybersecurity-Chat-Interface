@@ -2,14 +2,12 @@
 # CyberSec AI — Full Stack
 #
 # Services:
-#   app        — FastAPI backend + Streamlit UI
-#   ollama     — Local LLM server (ministral-3:8b + nomic-embed-text)
-#   etcd       — Milvus metadata store
-#   minio      — Milvus object storage
-#   milvus     — Vector + scalar database
-#
-# First-time setup (pull models into the named volume):
-#   docker compose run --rm ollama-init
+#   ollama       — Local LLM server
+#   ollama-init  — One-shot model puller (runs automatically, exits when done)
+#   etcd         — Milvus metadata store
+#   minio        — Milvus object storage
+#   milvus       — Vector + scalar database
+#   app          — FastAPI backend + Streamlit UI
 #
 # All ports and service URLs are configurable via .env
 # ─────────────────────────────────────────────────────────────────────────────
@@ -33,8 +31,6 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      # ollama/ollama image has no curl. Use the ollama CLI instead.
-      # `ollama list` connects to the local server and exits 0 when ready.
       test: ["CMD", "ollama", "list"]
       interval: 15s
       timeout: 10s
@@ -43,10 +39,13 @@ services:
     networks:
       - cybersec-net
 
-  # One-shot model puller — run once with:  docker compose run --rm ollama-init
+  # Pulls required models on every `docker compose up`.
+  # Safe to re-run — `ollama pull` is a no-op if the model is already present.
+  # Exits with code 0 when done; restart:no ensures it doesn't loop.
   ollama-init:
     image: ollama/ollama:latest
     container_name: cybersec-ollama-init
+    restart: "no"
     depends_on:
       ollama:
         condition: service_healthy
@@ -64,8 +63,6 @@ services:
       - OLLAMA_HOST=http://ollama:${OLLAMA_PORT:-11434}
     networks:
       - cybersec-net
-    profiles:
-      - init
 
   # ── Milvus stack ───────────────────────────────────────────────────────────
   etcd:
