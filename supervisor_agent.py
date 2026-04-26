@@ -6,7 +6,7 @@ LangGraph multi-agent supervisor.
 Fixes in this version
 ---------------------
 1. Shadowy-previous-answer bug
-   Root cause: `stream_mode="updates"` re-emits the supervisor’s intermediate
+   Root cause: `stream_mode="updates"` re-emits the supervisor's intermediate
    routing AIMessages from the checkpoint on every new turn. Hashing full
    content strings was unreliable because partial matches could slip through.
    Fix: snapshot the message COUNT in the checkpoint before streaming starts.
@@ -20,6 +20,12 @@ Fixes in this version
    Instead, only emit the tool-level label once we see the actual tool_call name.
    For rag_agent (which has only one tool) the node label is still used as
    fallback to ensure something always appears in the UI.
+
+3. TOOL_LABELS keys now match actual MCP-registered tool names
+   Root cause: TOOL_LABELS used the underlying Python function names
+   (e.g. check_ip_reputation) but MCP registers the @mcp.tool() wrapper names
+   (e.g. check_ip). The lookup never matched so labels were never emitted.
+   Fix: keys now exactly match what MultiServerMCPClient reports at load time.
 """
 
 import os
@@ -39,7 +45,7 @@ from agents.audit_agent import create_audit_agent
 
 load_dotenv()
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────────
 
 OLLAMA_BASE_URL  = os.getenv("OLLAMA_URL",       "http://localhost:11434")
 SUPERVISOR_MODEL = os.getenv("SUPERVISOR_MODEL", "qwen2.5:3b")
@@ -52,15 +58,19 @@ MCP_ENV = {
     if k in os.environ
 }
 
-# ── Label tables ──────────────────────────────────────────────────────────────────
+# ── Label tables ──────────────────────────────────────────────────────────────────────
 
-# Maps MCP tool function name → UI label shown in the agent indicator.
-# This is the single source of truth for what badge the user sees.
+# Maps MCP tool name (as registered by @mcp.tool() in mcp_rag_server.py)
+# → UI label shown in the agent indicator.
+#
+# These keys MUST match exactly what MultiServerMCPClient reports at load time.
+# The startup log line shows: ✅ Loaded 4 MCP tools: ['search_knowledge_base',
+# 'lookup_cve', 'check_ip', 'check_breach']
 TOOL_LABELS: dict[str, str] = {
-    "check_ip_reputation":   "\U0001f310 IP reputation check",
-    "cve_lookup":            "\U0001f50d CVE lookup",
-    "check_password_breach": "\U0001f511 Password breach check",
-    "search_cybersec_kb":    "\U0001f4da NIST / Framework Q&A",
+    "search_knowledge_base": "\U0001f4da NIST / Framework Q&A",
+    "lookup_cve":            "\U0001f50d CVE lookup",
+    "check_ip":              "\U0001f310 IP reputation check",
+    "check_breach":          "\U0001f511 Password breach check",
 }
 
 # Node-level fallback label — ONLY used for rag_agent because it has exactly
@@ -95,7 +105,7 @@ Multi-agent situations — use both in order when:
   • A breach check needs remediation policy (audit_agent → rag_agent)
 
 Context awareness:
-  • You have full access to this session’s conversation history
+  • You have full access to this session's conversation history
   • Use prior turns to resolve pronouns and follow-up questions
   • Do not re-explain things you already covered unless asked
 
@@ -166,8 +176,14 @@ async def stream(graph, messages: list[dict], session_id: str):
     activates. We wait until we see an AIMessage with tool_calls, then emit the
     tool-specific label (e.g. "🌐 IP reputation check"). Only rag_agent uses a
     node-level fallback label because it has a single, unambiguous tool.
+
+    Fix 3 — TOOL_LABELS keys match MCP-registered names
+    ----------------------------------------------------
+    LangGraph surfaces the tool name from the AIMessage.tool_calls[].name field
+    which is the @mcp.tool() wrapper name (e.g. "check_ip"), not the underlying
+    Python function name ("check_ip_reputation"). TOOL_LABELS keys now match.
     """
-    # ── Snapshot prior message count ──────────────────────────────────────────
+    # ── Snapshot prior message count ───────────────────────────────────────────────────
     prior_msg_count = 0
     try:
         prior_state = await graph.aget_state(config=_thread_config(session_id))
@@ -178,7 +194,7 @@ async def stream(graph, messages: list[dict], session_id: str):
 
     # Tracks labels already shown in the UI for this turn
     announced_agents: set[str] = set()
-    # Accumulates the supervisor’s growing answer for this turn (delta tracking)
+    # Accumulates the supervisor's growing answer for this turn (delta tracking)
     supervisor_answer = ""
     # Running count of messages seen across all steps so far this turn
     # (used to decide whether a supervisor message is new)
@@ -192,8 +208,8 @@ async def stream(graph, messages: list[dict], session_id: str):
         for node_name, node_state in step.items():
             msgs = node_state.get("messages", [])
 
-            # ── Tool-call labels (threat_agent / audit_agent) ─────────────────
-            # Inspect every AIMessage in this step’s delta for tool_calls.
+            # ── Tool-call labels (threat_agent / audit_agent) ─────────────────────
+            # Inspect every AIMessage in this step's delta for tool_calls.
             # Emit the tool-specific label the first time we see each tool.
             for msg in msgs:
                 if not isinstance(msg, AIMessage):
@@ -209,14 +225,14 @@ async def stream(graph, messages: list[dict], session_id: str):
                             announced_agents.add(label)
                             yield ("agent", label)
 
-            # ── Node-level fallback (rag_agent only) ────────────────────────
+            # ── Node-level fallback (rag_agent only) ────────────────────────────
             if node_name in NODE_FALLBACK_LABELS:
                 fallback = NODE_FALLBACK_LABELS[node_name]
                 if fallback not in announced_agents:
                     announced_agents.add(fallback)
                     yield ("agent", fallback)
 
-            # ── Supervisor final answer ──────────────────────────────────────
+            # ── Supervisor final answer ──────────────────────────────────────────────
             if node_name != "supervisor":
                 continue
 
@@ -239,10 +255,10 @@ async def stream(graph, messages: list[dict], session_id: str):
                 if not content:
                     break
 
-                # ── Index-based replay guard ──────────────────────────────
+                # ── Index-based replay guard ────────────────────────────────────────
                 # total_msgs_seen tracks how far into the checkpoint we are.
                 # We only process this supervisor message if it would fall
-                # at an index > prior_msg_count (i.e. it’s from this turn).
+                # at an index > prior_msg_count (i.e. it's from this turn).
                 total_msgs_seen += 1
                 if total_msgs_seen <= prior_msg_count:
                     break  # this message is from a previous turn, skip it
