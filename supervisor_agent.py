@@ -3,16 +3,27 @@ supervisor_agent.py
 ───────────────────
 LangGraph multi-agent supervisor.
 
-Refactored in this version
---------------------------
-- Removed MilvusCheckpointer dependency entirely.
-  The graph is compiled WITHOUT a checkpointer — LangGraph no longer owns state.
-- Conversation history is fetched explicitly from agents.chat_memory
-  (Milvus chat_memory collection) before each graph.astream() call.
-- History is prepended to the message list so the supervisor LLM has full
-  context without any checkpoint replay bugs.
-- api.py is responsible for writing each turn (user + assistant) to Milvus
-  via agents.chat_memory.append_message().
+Agent label fix
+---------------
+Previously only the first question showed the 'Using ...' indicator.
+Root cause: in LangGraph supervisor with stream_mode="updates", the step
+that contains a sub-agent's AIMessage with tool_calls can arrive BEFORE the
+tool result step, and the sub-agent name is set on the message. Scanning
+only for tool_calls in AIMessages missed turns where:
+  1. The tool_call AIMessage was emitted under the supervisor node (routing),
+     not the sub-agent node.
+  2. The sub-agent node emitted its result as an AIMessage with name set to
+     the agent (e.g. 'threat_agent') but no tool_calls key.
+
+Fix strategy — three complementary label sources, checked in this order:
+  A. Any node: AIMessage.tool_calls  → TOOL_LABELS (original, kept)
+  B. Any node: ToolMessage presence  → NODE_TO_LABEL (new — a ToolMessage
+     always follows a tool call, so its presence in the step confirms which
+     agent/tool ran)
+  C. Node name itself               → NODE_TO_LABEL (new — covers sub-agent
+     nodes that have no tool_calls in their delta messages)
+
+This ensures the indicator fires on question 1, 2, 3 … every time.
 """
 
 import os
@@ -20,7 +31,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_ollama import ChatOllama
 from langgraph_supervisor import create_supervisor
@@ -45,17 +56,25 @@ MCP_ENV = {
     if k in os.environ
 }
 
-# ── Label tables ──────────────────────────────────────────────────────────────────────────────────────
+# ── Label tables ───────────────────────────────────────────────────────────────────────────────────────
 
+# Source A: MCP tool name  → UI label
 TOOL_LABELS: dict[str, str] = {
     "search_knowledge_base": "\U0001f4da NIST / Framework Q&A",
     "lookup_cve":            "\U0001f50d CVE lookup",
     "check_ip":              "\U0001f310 IP reputation check",
     "check_breach":          "\U0001f511 Password breach check",
+    "get_conversation_history": "\U0001f9e0 Conversation history",
 }
 
-NODE_FALLBACK_LABELS: dict[str, str] = {
-    "rag_agent": "\U0001f4da NIST / Framework Q&A",
+# Source B/C: LangGraph node name  → UI label
+# Used when:
+#   B) A ToolMessage is present in the node's step (tool just ran)
+#   C) The node itself activated (catches rag_agent which has one tool)
+NODE_TO_LABEL: dict[str, str] = {
+    "rag_agent":    "\U0001f4da NIST / Framework Q&A",
+    "threat_agent": "\U0001f50d CVE / Threat Analysis",
+    "audit_agent":  "\U0001f511 Security Audit",
 }
 
 
@@ -121,16 +140,11 @@ async def build_supervisor_graph():
         model=supervisor_llm,
         prompt=SUPERVISOR_PROMPT,
     )
-    # Compile WITHOUT a checkpointer — history is managed via agents.chat_memory
     graph = workflow.compile()
     return graph, client
 
 
 def _history_to_messages(session_id: str) -> list[dict]:
-    """
-    Fetch recent turns from Milvus and convert to the role/content dict
-    format expected by LangGraph.
-    """
     messages = []
     for row in get_recent_messages(session_id, limit=6):
         role    = row.get("role")
@@ -140,21 +154,62 @@ def _history_to_messages(session_id: str) -> list[dict]:
     return messages
 
 
+def _try_emit_label(
+    node_name: str,
+    msgs: list,
+    announced: set[str],
+) -> list[tuple[str, str]]:
+    """
+    Returns a list of ("agent", label) events to emit for this step.
+
+    Three sources checked in priority order:
+      A. AIMessage.tool_calls  → TOOL_LABELS   (most specific)
+      B. ToolMessage present   → NODE_TO_LABEL  (tool just completed)
+      C. Node name             → NODE_TO_LABEL  (node activated)
+    """
+    events: list[tuple[str, str]] = []
+
+    def _emit(label: str) -> None:
+        if label and label not in announced:
+            announced.add(label)
+            events.append(("agent", label))
+
+    # A — scan every AIMessage in this step for tool_calls
+    for msg in msgs:
+        if not isinstance(msg, AIMessage):
+            continue
+        for tc in getattr(msg, "tool_calls", []) or []:
+            tool_name = (
+                tc.get("name", "") if isinstance(tc, dict)
+                else getattr(tc, "name", "")
+            )
+            if tool_name in TOOL_LABELS:
+                _emit(TOOL_LABELS[tool_name])
+
+    # B — if a ToolMessage is in the step, the tool ran; use node label
+    has_tool_result = any(isinstance(m, ToolMessage) for m in msgs)
+    if has_tool_result and node_name in NODE_TO_LABEL:
+        _emit(NODE_TO_LABEL[node_name])
+
+    # C — node itself activated; use node label as fallback
+    if node_name in NODE_TO_LABEL:
+        _emit(NODE_TO_LABEL[node_name])
+
+    return events
+
+
 async def stream(graph, messages: list[dict], session_id: str):
     """
     Async generator → yields ("agent", label) | ("text", chunk)
 
-    History injection
-    -----------------
-    Recent turns are fetched from Milvus and prepended to `messages` before
-    calling graph.astream(). The graph runs statelessly each time — no
-    checkpoint replay, no shadowy-previous-answer bugs.
+    Emits exactly one agent label per turn (the first one encountered),
+    then streams the supervisor's final answer as text chunks.
     """
+    # Reset per-turn tracking
     announced_agents: set[str] = set()
     supervisor_answer = ""
 
-    # Inject history BEFORE the current user message
-    history     = _history_to_messages(session_id)
+    history      = _history_to_messages(session_id)
     conversation = history + messages
 
     async for step in graph.astream(
@@ -164,27 +219,9 @@ async def stream(graph, messages: list[dict], session_id: str):
         for node_name, node_state in step.items():
             msgs = node_state.get("messages", [])
 
-            # ── Tool-call labels (threat_agent / audit_agent) ────────────────────
-            for msg in msgs:
-                if not isinstance(msg, AIMessage):
-                    continue
-                for tc in getattr(msg, "tool_calls", []) or []:
-                    tool_name = (
-                        tc.get("name", "") if isinstance(tc, dict)
-                        else getattr(tc, "name", "")
-                    )
-                    if tool_name in TOOL_LABELS:
-                        label = TOOL_LABELS[tool_name]
-                        if label not in announced_agents:
-                            announced_agents.add(label)
-                            yield ("agent", label)
-
-            # ── Node-level fallback (rag_agent only) ────────────────────────
-            if node_name in NODE_FALLBACK_LABELS:
-                fallback = NODE_FALLBACK_LABELS[node_name]
-                if fallback not in announced_agents:
-                    announced_agents.add(fallback)
-                    yield ("agent", fallback)
+            # ── Emit agent label ─────────────────────────────────────────────────
+            for event in _try_emit_label(node_name, msgs, announced_agents):
+                yield event
 
             # ── Supervisor final answer ─────────────────────────────────────────
             if node_name != "supervisor":
