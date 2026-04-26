@@ -2,6 +2,8 @@
 api.py
 ──────
 FastAPI layer over the LangGraph supervisor agent.
+Chat memory (read & write) is handled via Milvus chat_memory collection
+instead of the LangGraph checkpointer.
 
 Endpoints:
   POST /chat              — non-streaming, returns full response JSON
@@ -12,10 +14,10 @@ Endpoints:
   GET  /health            — liveness probe
 
 SSE event format for /chat/stream:
-  Regular text chunks:       data: <text>\n\n
-  Agent routing indicator:   event: agent\ndata: {"label": "..."}\n\n
-  Done sentinel:             event: done\ndata: {"session_id": "..."}\n\n
-  Error:                     event: error\ndata: {"error": "..."}\n\n
+  Regular text chunks:       data: <text>
+  Agent routing indicator:   event: agent\ndata: {"label": "..."}
+  Done sentinel:             event: done\ndata: {"session_id": "..."}
+  Error:                     event: error\ndata: {"error": "..."}
 """
 
 import json
@@ -26,12 +28,12 @@ from typing import AsyncIterator
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel, Field
 
+from agents.chat_memory import append_message, clear_session, list_sessions
 from supervisor_agent import build_supervisor_graph, stream as agent_stream, get_history
 
-# ── App state ──────────────────────────────────────────────────────────────────────
+# ── App state ───────────────────────────────────────────────────────────────────────────────
 
 APP_STATE: dict = {}
 
@@ -50,7 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="CyberSec AI Chat API",
     description="AI-powered cybersecurity assistant backed by a LangGraph supervisor.",
-    version="1.1.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -62,11 +64,11 @@ app.add_middleware(
 )
 
 
-# ── Request / Response models ─────────────────────────────────────────────────────
+# ── Request / Response models ───────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message:    str          = Field(..., min_length=1, max_length=4000)
-    session_id: str | None   = Field(default=None)
+    message:    str        = Field(..., min_length=1, max_length=4000)
+    session_id: str | None = Field(default=None)
 
 
 class ChatResponse(BaseModel):
@@ -91,7 +93,7 @@ class SessionInfo(BaseModel):
     updated_at: int
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────────────────────
 
 def _resolve_session(session_id: str | None) -> str:
     return session_id or str(uuid.uuid4())
@@ -104,39 +106,7 @@ def _validate_message(message: str) -> str:
     return msg
 
 
-def _serialise_history(messages: list) -> list[HistoryMessage]:
-    out = []
-    for m in messages:
-        if isinstance(m, HumanMessage):
-            role = "user"
-        elif isinstance(m, AIMessage):
-            role = "assistant"
-        elif isinstance(m, ToolMessage):
-            role = "tool"
-        else:
-            role = "system"
-        content = m.content
-        if isinstance(content, list):
-            content = " ".join(
-                c.get("text", "") if isinstance(c, dict) else str(c)
-                for c in content
-            )
-        out.append(HistoryMessage(role=role, content=str(content)))
-    return out
-
-
-def _register_session(graph, session_id: str, summary: str) -> None:
-    """Persist session summary to Milvus via the checkpointer."""
-    try:
-        checkpointer = graph.checkpointer
-        if hasattr(checkpointer, "register_session"):
-            checkpointer.register_session(session_id, summary)
-    except Exception as exc:
-        # Non-fatal — session list is cosmetic
-        print(f"⚠️  Session registry update failed: {exc}")
-
-
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes ───────────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health() -> dict:
@@ -144,24 +114,9 @@ async def health() -> dict:
 
 
 @app.get("/sessions", response_model=list[SessionInfo])
-async def list_sessions() -> list[SessionInfo]:
+async def sessions() -> list[SessionInfo]:
     """Return all sessions in Milvus ordered by most-recently updated."""
-    graph = APP_STATE.get("graph")
-    if graph is None:
-        raise HTTPException(status_code=503, detail="Agent not initialised.")
-    checkpointer = graph.checkpointer
-    if not hasattr(checkpointer, "list_sessions"):
-        return []
-    rows = checkpointer.list_sessions()
-    return [
-        SessionInfo(
-            session_id=r["session_id"],
-            summary=r.get("summary", ""),
-            created_at=r.get("created_at", 0),
-            updated_at=r.get("updated_at", 0),
-        )
-        for r in rows
-    ]
+    return [SessionInfo(**row) for row in list_sessions()]
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -169,16 +124,26 @@ async def chat(req: ChatRequest) -> ChatResponse:
     graph      = APP_STATE.get("graph")
     if graph is None:
         raise HTTPException(status_code=503, detail="Agent not initialised.")
+
     message    = _validate_message(req.message)
     session_id = _resolve_session(req.session_id)
-    _register_session(graph, session_id, message[:100])
+
+    # Persist the user turn BEFORE calling the agent so it
+    # is available if history is fetched mid-stream.
+    append_message(session_id, "user", message)
+
     full_answer = ""
     try:
-        async for kind, value in agent_stream(graph, [{"role": "user", "content": message}], session_id):
+        async for kind, value in agent_stream(
+            graph, [{"role": "user", "content": message}], session_id
+        ):
             if kind == "text":
                 full_answer += value
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
+
+    # Persist the assistant response
+    append_message(session_id, "assistant", full_answer)
     return ChatResponse(session_id=session_id, answer=full_answer)
 
 
@@ -196,11 +161,14 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
     graph = APP_STATE.get("graph")
     if graph is None:
         raise HTTPException(status_code=503, detail="Agent not initialised.")
+
     message    = _validate_message(req.message)
     session_id = _resolve_session(req.session_id)
-    _register_session(graph, session_id, message[:100])
+
+    append_message(session_id, "user", message)
 
     async def event_generator():
+        full_answer = ""
         try:
             async for kind, value in agent_stream(
                 graph,
@@ -211,11 +179,14 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                     payload = json.dumps({"label": value})
                     yield f"event: agent\ndata: {payload}\n\n"
                 elif kind == "text":
+                    full_answer += value
                     safe = value.replace("\n", "\\n")
                     yield f"data: {safe}\n\n"
         except Exception as exc:
             yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
         finally:
+            if full_answer:
+                append_message(session_id, "assistant", full_answer)
             yield f"event: done\ndata: {json.dumps({'session_id': session_id})}\n\n"
 
     return StreamingResponse(
@@ -227,21 +198,14 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
 @app.get("/history/{session_id}", response_model=HistoryResponse)
 async def history(session_id: str) -> HistoryResponse:
-    graph = APP_STATE.get("graph")
-    if graph is None:
-        raise HTTPException(status_code=503, detail="Agent not initialised.")
-    msgs = await get_history(graph, session_id)
+    msgs = await get_history(session_id)
     return HistoryResponse(
         session_id=session_id,
-        messages=_serialise_history(msgs),
+        messages=[HistoryMessage(role=m["role"], content=m["content"]) for m in msgs],
     )
 
 
 @app.delete("/session/{session_id}")
 async def delete_session(session_id: str) -> dict:
-    graph = APP_STATE.get("graph")
-    if graph is None:
-        raise HTTPException(status_code=503, detail="Agent not initialised.")
-    checkpointer = graph.checkpointer
-    deleted = checkpointer.clear_session(session_id)
+    deleted = clear_session(session_id)
     return {"session_id": session_id, "deleted_checkpoints": deleted}
