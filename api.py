@@ -2,8 +2,7 @@
 api.py
 ──────
 FastAPI layer over the LangGraph supervisor agent.
-Chat memory (read & write) is handled via Milvus chat_memory collection
-instead of the LangGraph checkpointer.
+All ports and service URLs are read from environment variables.
 
 Endpoints:
   POST /chat              — non-streaming, returns full response JSON
@@ -12,15 +11,10 @@ Endpoints:
   GET  /sessions          — list all sessions with summaries
   DELETE /session/{id}    — clear a session (New Chat)
   GET  /health            — liveness probe
-
-SSE event format for /chat/stream:
-  Regular text chunks:       data: <text>
-  Agent routing indicator:   event: agent\ndata: {"label": "..."}
-  Done sentinel:             event: done\ndata: {"session_id": "..."}
-  Error:                     event: error\ndata: {"error": "..."}
 """
 
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -29,11 +23,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 from agents.chat_memory import append_message, clear_session, list_sessions
 from supervisor_agent import build_supervisor_graph, stream as agent_stream, get_history
 
-# ── App state ───────────────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+# CORS origins — override via CORS_ORIGINS (comma-separated list or "*")
+_CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+
+# ── App state ─────────────────────────────────────────────────────────────────
 
 APP_STATE: dict = {}
 
@@ -58,13 +58,13 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ── Request / Response models ───────────────────────────────────────────────────────────────────────
+# ── Request / Response models ─────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message:    str        = Field(..., min_length=1, max_length=4000)
@@ -93,7 +93,7 @@ class SessionInfo(BaseModel):
     updated_at: int
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _resolve_session(session_id: str | None) -> str:
     return session_id or str(uuid.uuid4())
@@ -106,7 +106,7 @@ def _validate_message(message: str) -> str:
     return msg
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health() -> dict:
@@ -115,21 +115,18 @@ async def health() -> dict:
 
 @app.get("/sessions", response_model=list[SessionInfo])
 async def sessions() -> list[SessionInfo]:
-    """Return all sessions in Milvus ordered by most-recently updated."""
     return [SessionInfo(**row) for row in list_sessions()]
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    graph      = APP_STATE.get("graph")
+    graph = APP_STATE.get("graph")
     if graph is None:
         raise HTTPException(status_code=503, detail="Agent not initialised.")
 
     message    = _validate_message(req.message)
     session_id = _resolve_session(req.session_id)
 
-    # Persist the user turn BEFORE calling the agent so it
-    # is available if history is fetched mid-stream.
     append_message(session_id, "user", message)
 
     full_answer = ""
@@ -142,22 +139,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
 
-    # Persist the assistant response
     append_message(session_id, "assistant", full_answer)
     return ChatResponse(session_id=session_id, answer=full_answer)
 
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
-    """
-    Streaming SSE endpoint.
-
-    Event types:
-      (default)      data: <text chunk>              regular answer text
-      event: agent   data: {"label": "..."}           agent routing indicator
-      event: done    data: {"session_id": "..."}      completion sentinel
-      event: error   data: {"error": "..."}           error
-    """
     graph = APP_STATE.get("graph")
     if graph is None:
         raise HTTPException(status_code=503, detail="Agent not initialised.")

@@ -2,28 +2,8 @@
 supervisor_agent.py
 ───────────────────
 LangGraph multi-agent supervisor.
-
-Agent label fix
----------------
-Previously only the first question showed the 'Using ...' indicator.
-Root cause: in LangGraph supervisor with stream_mode="updates", the step
-that contains a sub-agent's AIMessage with tool_calls can arrive BEFORE the
-tool result step, and the sub-agent name is set on the message. Scanning
-only for tool_calls in AIMessages missed turns where:
-  1. The tool_call AIMessage was emitted under the supervisor node (routing),
-     not the sub-agent node.
-  2. The sub-agent node emitted its result as an AIMessage with name set to
-     the agent (e.g. 'threat_agent') but no tool_calls key.
-
-Fix strategy — three complementary label sources, checked in this order:
-  A. Any node: AIMessage.tool_calls  → TOOL_LABELS (original, kept)
-  B. Any node: ToolMessage presence  → NODE_TO_LABEL (new — a ToolMessage
-     always follows a tool call, so its presence in the step confirms which
-     agent/tool ran)
-  C. Node name itself               → NODE_TO_LABEL (new — covers sub-agent
-     nodes that have no tool_calls in their delta messages)
-
-This ensures the indicator fires on question 1, 2, 3 … every time.
+All model names, URLs, ports, and tuning parameters are read from
+environment variables — see .env.example for the full list.
 """
 
 import os
@@ -43,34 +23,35 @@ from agents.audit_agent import create_audit_agent
 
 load_dotenv()
 
-# ── Config ──────────────────────────────────────────────────────────────────────────────────
-
-OLLAMA_BASE_URL  = os.getenv("OLLAMA_URL",       "http://localhost:11434")
-SUPERVISOR_MODEL = os.getenv("SUPERVISOR_MODEL", "qwen2.5:3b")
+# ── Config ────────────────────────────────────────────────────────────────────
+OLLAMA_BASE_URL  = os.getenv("OLLAMA_URL",        "http://localhost:11434")
+SUPERVISOR_MODEL = os.getenv("SUPERVISOR_MODEL",  "ministral:8b")
+SUPERVISOR_TEMP  = float(os.getenv("SUPERVISOR_TEMPERATURE", "0"))
+SUPERVISOR_CTX   = int(os.getenv("SUPERVISOR_CTX",           "4096"))
+HISTORY_LIMIT    = int(os.getenv("HISTORY_LIMIT",            "6"))   # turns to inject
 
 MCP_SERVER_PATH = str(Path(__file__).resolve().parent / "mcp_rag_server.py")
 
 MCP_ENV = {
     k: os.environ[k]
-    for k in ("ABUSEIPDB_API_KEY", "MILVUS_URI", "OLLAMA_URL")
+    for k in ("ABUSEIPDB_API_KEY", "MILVUS_URI", "OLLAMA_URL",
+              "COLLECTION_NAME", "EMBED_MODEL", "HTTP_TIMEOUT", "EMBED_TIMEOUT",
+              "NVD_BASE_URL", "ABUSEIPDB_BASE_URL", "HIBP_BASE_URL",
+              "RAG_TOP_K", "RAG_SCORE_THRESHOLD", "IP_MALICIOUS_THRESHOLD",
+              "CHAT_MEMORY_COLLECTION", "CHAT_MEMORY_MAX_TEXT")
     if k in os.environ
 }
 
-# ── Label tables ───────────────────────────────────────────────────────────────────────────────────────
+# ── Label tables ──────────────────────────────────────────────────────────────
 
-# Source A: MCP tool name  → UI label
 TOOL_LABELS: dict[str, str] = {
-    "search_knowledge_base": "\U0001f4da NIST / Framework Q&A",
-    "lookup_cve":            "\U0001f50d CVE lookup",
-    "check_ip":              "\U0001f310 IP reputation check",
-    "check_breach":          "\U0001f511 Password breach check",
+    "search_knowledge_base":    "\U0001f4da NIST / Framework Q&A",
+    "lookup_cve":               "\U0001f50d CVE lookup",
+    "check_ip":                 "\U0001f310 IP reputation check",
+    "check_breach":             "\U0001f511 Password breach check",
     "get_conversation_history": "\U0001f9e0 Conversation history",
 }
 
-# Source B/C: LangGraph node name  → UI label
-# Used when:
-#   B) A ToolMessage is present in the node's step (tool just ran)
-#   C) The node itself activated (catches rag_agent which has one tool)
 NODE_TO_LABEL: dict[str, str] = {
     "rag_agent":    "\U0001f4da NIST / Framework Q&A",
     "threat_agent": "\U0001f50d CVE / Threat Analysis",
@@ -130,8 +111,8 @@ async def build_supervisor_graph():
     supervisor_llm = ChatOllama(
         model=SUPERVISOR_MODEL,
         base_url=OLLAMA_BASE_URL,
-        temperature=0,
-        num_ctx=4096,
+        temperature=SUPERVISOR_TEMP,
+        num_ctx=SUPERVISOR_CTX,
     )
     print(f"✅ Supervisor model: {SUPERVISOR_MODEL}")
 
@@ -146,7 +127,7 @@ async def build_supervisor_graph():
 
 def _history_to_messages(session_id: str) -> list[dict]:
     messages = []
-    for row in get_recent_messages(session_id, limit=6):
+    for row in get_recent_messages(session_id, limit=HISTORY_LIMIT):
         role    = row.get("role")
         content = row.get("content") or ""
         if role in {"user", "assistant"} and content:
@@ -159,14 +140,6 @@ def _try_emit_label(
     msgs: list,
     announced: set[str],
 ) -> list[tuple[str, str]]:
-    """
-    Returns a list of ("agent", label) events to emit for this step.
-
-    Three sources checked in priority order:
-      A. AIMessage.tool_calls  → TOOL_LABELS   (most specific)
-      B. ToolMessage present   → NODE_TO_LABEL  (tool just completed)
-      C. Node name             → NODE_TO_LABEL  (node activated)
-    """
     events: list[tuple[str, str]] = []
 
     def _emit(label: str) -> None:
@@ -174,7 +147,6 @@ def _try_emit_label(
             announced.add(label)
             events.append(("agent", label))
 
-    # A — scan every AIMessage in this step for tool_calls
     for msg in msgs:
         if not isinstance(msg, AIMessage):
             continue
@@ -186,12 +158,10 @@ def _try_emit_label(
             if tool_name in TOOL_LABELS:
                 _emit(TOOL_LABELS[tool_name])
 
-    # B — if a ToolMessage is in the step, the tool ran; use node label
     has_tool_result = any(isinstance(m, ToolMessage) for m in msgs)
     if has_tool_result and node_name in NODE_TO_LABEL:
         _emit(NODE_TO_LABEL[node_name])
 
-    # C — node itself activated; use node label as fallback
     if node_name in NODE_TO_LABEL:
         _emit(NODE_TO_LABEL[node_name])
 
@@ -199,13 +169,6 @@ def _try_emit_label(
 
 
 async def stream(graph, messages: list[dict], session_id: str):
-    """
-    Async generator → yields ("agent", label) | ("text", chunk)
-
-    Emits exactly one agent label per turn (the first one encountered),
-    then streams the supervisor's final answer as text chunks.
-    """
-    # Reset per-turn tracking
     announced_agents: set[str] = set()
     supervisor_answer = ""
 
@@ -219,11 +182,9 @@ async def stream(graph, messages: list[dict], session_id: str):
         for node_name, node_state in step.items():
             msgs = node_state.get("messages", [])
 
-            # ── Emit agent label ─────────────────────────────────────────────────
             for event in _try_emit_label(node_name, msgs, announced_agents):
                 yield event
 
-            # ── Supervisor final answer ─────────────────────────────────────────
             if node_name != "supervisor":
                 continue
 
@@ -252,5 +213,4 @@ async def stream(graph, messages: list[dict], session_id: str):
 
 
 async def get_history(session_id: str) -> list[dict]:
-    """Return recent messages for a session (used by GET /history)."""
     return _history_to_messages(session_id)

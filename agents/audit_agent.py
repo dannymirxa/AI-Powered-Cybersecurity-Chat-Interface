@@ -5,8 +5,8 @@ Specialised agent: security audit & credential hygiene.
   - Password breach checks via HIBP (k-anonymity, no plaintext sent)
   - Policy recommendations based on breach results
 
-Model  : AGENT_MODEL env var  (default: qwen2.5:3b)
-Tools  : check_breach  (from MCP server)
+All model names, URLs, and tuning parameters are read from environment
+variables — see .env.example for the full list.
 """
 
 import os
@@ -17,8 +17,10 @@ from langchain.agents import create_agent
 
 load_dotenv()
 
-AGENT_MODEL     = os.getenv("AGENT_MODEL",  "qwen2.5:3b")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_URL",   "http://localhost:11434")
+AGENT_MODEL      = os.getenv("AGENT_MODEL",   "qwen2.5:3b")
+OLLAMA_BASE_URL  = os.getenv("OLLAMA_URL",    "http://localhost:11434")
+AGENT_TEMP       = float(os.getenv("AGENT_TEMPERATURE", "0.1"))
+AGENT_CTX        = int(os.getenv("AGENT_CTX",           "4096"))
 
 SYSTEM_PROMPT = """You are a Security Auditor specialised in credential hygiene
 and access control policy.
@@ -46,8 +48,8 @@ def create_audit_agent(tools: list):
     llm = ChatOllama(
         model=AGENT_MODEL,
         base_url=OLLAMA_BASE_URL,
-        temperature=0.1,
-        num_ctx=4096,
+        temperature=AGENT_TEMP,
+        num_ctx=AGENT_CTX,
     )
     print(f"✅ audit_agent model: {AGENT_MODEL}")
 
