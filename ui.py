@@ -9,6 +9,7 @@ Changes in this version:
   3. Sidebar shows all previous sessions from Milvus — click to switch
   4. Fresh session auto-created on every page load/refresh
   5. Fixed SSE parsing to handle 'event:' lines before 'data:' lines
+  6. Added delete button (🗑) per previous session in sidebar
 """
 
 import json
@@ -83,6 +84,26 @@ def _switch_session(session_id: str, summary: str) -> None:
             ]
     except Exception:
         pass
+    st.rerun()
+
+
+def _delete_session(session_id: str) -> None:
+    """
+    Call DELETE /session/{id} on the backend, then — if the deleted session
+    was the active one — start a fresh chat.  Always triggers a rerun so the
+    sidebar list refreshes.
+    """
+    try:
+        requests.delete(api(f"/session/{session_id}"), timeout=5)
+    except Exception:
+        pass  # best-effort: still clear locally even if backend unreachable
+
+    if st.session_state.session_id == session_id:
+        # Active session was deleted — start fresh
+        st.session_state.session_id      = str(uuid.uuid4())
+        st.session_state.session_summary = "New conversation"
+        st.session_state.messages        = []
+
     st.rerun()
 
 
@@ -165,15 +186,26 @@ with st.sidebar:
     # Current session summary + New Chat button
     st.markdown("**Current Session**")
     st.info(f"💬 {st.session_state.session_summary}")
-    if st.button("🗑 New Chat", use_container_width=True):
-        new_chat()
+
+    col_new, col_del_cur = st.columns([3, 1])
+    with col_new:
+        if st.button("🗑 New Chat", use_container_width=True):
+            new_chat()
+    with col_del_cur:
+        if st.button(
+            "❌",
+            key="del_current",
+            help="Delete current session",
+            use_container_width=True,
+        ):
+            _delete_session(st.session_state.session_id)
 
     st.divider()
 
     # Previous sessions list
     st.markdown("**Previous Sessions**")
     sessions = _fetch_sessions()
-    # Filter out current session so it doesn’t appear in the list
+    # Filter out current session so it doesn't appear in the list
     prev_sessions = [s for s in sessions if s["session_id"] != st.session_state.session_id]
 
     if not prev_sessions:
@@ -181,10 +213,26 @@ with st.sidebar:
     else:
         for s in prev_sessions:
             label   = s.get("summary") or s["session_id"][:24] + "..."
-            # Truncate long labels
-            display = label[:50] + "…" if len(label) > 50 else label
-            if st.button(f"💬 {display}", key=s["session_id"], use_container_width=True):
-                _switch_session(s["session_id"], label)
+            display = label[:40] + "…" if len(label) > 40 else label
+            sid     = s["session_id"]
+
+            # Each session row: [chat button (wide)] [delete button (narrow)]
+            col_chat, col_del = st.columns([5, 1])
+            with col_chat:
+                if st.button(
+                    f"💬 {display}",
+                    key=f"switch_{sid}",
+                    use_container_width=True,
+                ):
+                    _switch_session(sid, label)
+            with col_del:
+                if st.button(
+                    "🗑",
+                    key=f"del_{sid}",
+                    help=f"Delete: {label}",
+                    use_container_width=True,
+                ):
+                    _delete_session(sid)
 
     st.divider()
     st.markdown("""
