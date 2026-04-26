@@ -9,14 +9,12 @@ Tools:
   2. cve_lookup             — CVE details from NIST NVD (no API key needed)
   3. check_ip_reputation    — IP abuse score from AbuseIPDB (free API key)
   4. check_password_breach  — Pwned password check via HIBP k-anonymity (no key)
-  5. get_chat_history_tool  — Retrieve recent chat turns from Milvus memory
 
 CLI test:
   python tools/rag_tool.py rag      "What is NIST CSF Govern function?"
   python tools/rag_tool.py cve      CVE-2021-44228
   python tools/rag_tool.py ip       8.8.8.8
   python tools/rag_tool.py breach   password123
-  python tools/rag_tool.py history  <session_id>
 """
 
 import hashlib
@@ -357,14 +355,6 @@ def check_password_breach(password: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TOOL 5 — Chat History (Milvus)
-# Re-exported here so agents only need to import from tools/rag_tool.py
-# ═══════════════════════════════════════════════════════════════════════════════
-
-from memory.chat_memory import get_chat_history_tool   # noqa: E402  (after stdlib imports)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # CLI — Test any tool individually
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -378,7 +368,6 @@ Usage:
   python tools/rag_tool.py cve     <CVE-ID or keyword>
   python tools/rag_tool.py ip      <ip_address>
   python tools/rag_tool.py breach  <password>
-  python tools/rag_tool.py history <session_id>
 
 Examples:
   python tools/rag_tool.py rag    "NIST CSF Govern function"
@@ -386,7 +375,6 @@ Examples:
   python tools/rag_tool.py cve    log4j
   python tools/rag_tool.py ip     1.2.3.4
   python tools/rag_tool.py breach password123
-  python tools/rag_tool.py history my-session-abc
 """
 
     if len(sys.argv) < 3:
@@ -400,18 +388,18 @@ Examples:
         if tool_name == "rag":
             result = search_cybersec_kb(arg)
             if not result["results"]:
-                print("\u274c No results above threshold.")
+                print("❌ No results above threshold.")
             else:
                 for i, r in enumerate(result["results"], 1):
-                    print(f"\n\u2500\u2500 Result {i} \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-                    print(f"\U0001f4c4 {r['source']}  chunk #{r['chunk_index']}  score {r['score']}")
+                    print(f"\n── Result {i} ──────────────────────────────────────────")
+                    print(f"📄 {r['source']}  chunk #{r['chunk_index']}  score {r['score']}")
                     print(r["text"][:500] + ("..." if len(r["text"]) > 500 else ""))
 
         elif tool_name == "cve":
             cve_id  = arg if re.match(r"CVE-\d{4}-\d+", arg, re.I) else None
             keyword = None if cve_id else arg
             result  = cve_lookup(cve_id=cve_id, keyword=keyword)
-            print(f"\n\U0001f50e Found {result['total']} CVE(s)\n")
+            print(f"\n🔎 Found {result['total']} CVE(s)\n")
             for cve in result["cves"]:
                 print(f"  ID       : {cve['id']}")
                 print(f"  Severity : {cve['severity']}  (CVSS {cve['score']})")
@@ -422,8 +410,8 @@ Examples:
 
         elif tool_name == "ip":
             result = check_ip_reputation(arg)
-            flag   = "\U0001f6a8 MALICIOUS" if result["is_malicious"] else "\u2705 CLEAN"
-            print(f"\n{flag}  \u2014  {result['ip']}")
+            flag   = "🚨 MALICIOUS" if result["is_malicious"] else "✅ CLEAN"
+            print(f"\n{flag}  —  {result['ip']}")
             print(f"  Confidence : {result['confidence_score']}%")
             print(f"  Reports    : {result['total_reports']}")
             print(f"  Country    : {result['country']}")
@@ -432,26 +420,22 @@ Examples:
 
         elif tool_name == "breach":
             result = check_password_breach(arg)
-            flag   = "\U0001f6a8 BREACHED" if result["breached"] else "\u2705 NOT FOUND"
+            flag   = "🚨 BREACHED" if result["breached"] else "✅ NOT FOUND"
             print(f"\n{flag}")
             print(f"  Times found : {result['times_found']:,}")
             print(f"  Risk level  : {result['risk_level'].upper()}")
             print(f"  Action      : {result['recommendation']}")
-
-        elif tool_name == "history":
-            output = get_chat_history_tool(session_id=arg)
-            print(output)
 
         else:
             print(f"Unknown tool: '{tool_name}'\n{USAGE}")
             sys.exit(1)
 
     except EnvironmentError as e:
-        print(f"\u2699\ufe0f  Config error: {e}")
+        print(f"⚙️  Config error: {e}")
         sys.exit(1)
     except requests.HTTPError as e:
-        print(f"\U0001f310 API error: {e}")
+        print(f"🌐 API error: {e}")
         sys.exit(1)
     except Exception as e:
-        print(f"\u274c Unexpected error: {e}")
+        print(f"❌ Unexpected error: {e}")
         sys.exit(1)

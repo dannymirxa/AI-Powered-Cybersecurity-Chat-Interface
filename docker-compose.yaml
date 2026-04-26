@@ -1,8 +1,3 @@
-# Milvus standalone stack
-# Collections created automatically on first run:
-#   cybersec_kb   — RAG knowledge base (vectors)
-#   chat_memory   — Conversation history (scalar fields only)
-
 services:
   etcd:
     container_name: milvus-etcd
@@ -44,7 +39,7 @@ services:
     image: milvusdb/milvus:v2.6.15
     command: ["milvus", "run", "standalone"]
     security_opt:
-      - seccomp:unconfined
+    - seccomp:unconfined
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
