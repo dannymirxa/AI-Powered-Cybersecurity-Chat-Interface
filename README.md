@@ -1,26 +1,24 @@
 # 🛡️ AI-Powered Cybersecurity Chat Interface
 
-A full-stack AI chat application for the cybersecurity domain, built with
+A full-stack, locally-hosted AI chat application for the cybersecurity domain, built with
 **LangGraph**, **Ollama**, **Milvus**, and **Streamlit** — running entirely
-locally in Docker with no cloud dependencies.
-
-> **Assessment ref:** EGS-AI-CHAT-2026 | EC-Council Global Services — EGS-AI Division
+in Docker with no cloud dependencies.
 
 ---
 
-## ✨ What It Does
+## ✨ Features
 
-| Phase | Capability | Implementation |
-|---|---|---|
-| **01** Backend & LLM | Streaming SSE chat, domain scoping, session memory | FastAPI + LangGraph + Ollama (`ministral-3:8b`) |
-| **02** Knowledge Retrieval | RAG over NIST CSF 2.0 docs, source attribution | Milvus vector store + `nomic-embed-text` embeddings |
-| **03** Chat UI | Real-time streaming, agent indicators, session history | Streamlit with custom CSS |
-| **04** Agentic Tools | 4 autonomous tools invoked without user prompting | MCP server via LangGraph supervisor |
-| **05** Code Quality | Env vars throughout, input validation, modular layout | `.env.example`, Pydantic models, Docker Compose |
+| Capability | Implementation |
+|---|---|
+| Streaming chat with cybersecurity-scoped AI | FastAPI SSE + LangGraph + Ollama (`ministral-3:8b`) |
+| RAG over NIST CSF 2.0 documents, with source attribution | Milvus vector store + `nomic-embed-text` embeddings |
+| Real-time UI with agent activity indicators and session history | Streamlit with custom CSS |
+| 4 autonomous cybersecurity tools invoked without user prompting | MCP server via LangGraph supervisor |
+| Fully configurable via env vars, no hardcoded secrets | `.env.example`, Pydantic validation, Docker Compose |
 
 ---
 
-## 🧠 Agentic Tools (Phase 04)
+## 🧠 Agentic Tools
 
 The supervisor LLM autonomously decides which tool(s) to call based on the
 conversation. There is no manual trigger. The UI shows a `✨ Using …` indicator
