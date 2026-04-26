@@ -1,22 +1,21 @@
 """
 agents/chat_memory.py
 ─────────────────────
-Simple Milvus-backed chat memory.
+Milvus-backed chat memory.
 
-Replaces MilvusCheckpointer with lightweight functions:
-  - append_message(session_id, role, content)  → insert a row
-  - get_recent_messages(session_id, limit)      → SELECT TOP N ... ORDER BY created_at
-  - list_sessions(limit)                        → all sessions with summary
-  - clear_session(session_id)                   → delete all rows for a session
+Functions:
+  append_message(session_id, role, content)  — insert a message
+  get_recent_messages(session_id, limit)      — fetch last N messages (chronological)
+  list_sessions(limit)                        — all sessions with summary metadata
+  clear_session(session_id)                   — delete all rows for a session
 
-Milvus collection schema (auto-created on first use):
-  id          VARCHAR(64)    primary key
+Schema (auto-created on first use):
+  id          VARCHAR(64)     primary key
   session_id  VARCHAR(128)
-  role        VARCHAR(32)    'user' | 'assistant'
-  content     VARCHAR(12000)
-  created_at  INT64          epoch-milliseconds
-  _vec        FLOAT_VECTOR(2) dummy — Milvus requires at least one vector field;
-                              always stored as [0.0, 0.0] and never queried.
+  role        VARCHAR(32)     'user' | 'assistant'
+  content     VARCHAR(12000)  configurable via CHAT_MEMORY_MAX_TEXT
+  created_at  INT64           epoch-milliseconds
+  _vec        FLOAT_VECTOR(2) required by Milvus schema; always [0, 0], never queried
 """
 
 import os
@@ -33,12 +32,10 @@ from pymilvus import (
     utility,
 )
 
-MILVUS_URI             = os.getenv("MILVUS_URI", "http://localhost:19530")
+MILVUS_URI             = os.getenv("MILVUS_URI",             "http://localhost:19530")
 CHAT_MEMORY_COLLECTION = os.getenv("CHAT_MEMORY_COLLECTION", "chat_memory")
 CHAT_MEMORY_MAX_TEXT   = int(os.getenv("CHAT_MEMORY_MAX_TEXT", "12000"))
 
-# Dummy vector stored with every row so Milvus schema validation passes.
-# The field is never used for similarity search.
 _DUMMY_VEC = [0.0, 0.0]
 
 
@@ -55,18 +52,11 @@ def _build_collection() -> Collection:
         FieldSchema(name="content",    dtype=DataType.VARCHAR,
                     max_length=CHAT_MEMORY_MAX_TEXT),
         FieldSchema(name="created_at", dtype=DataType.INT64),
-        # Milvus requires at least one vector field per collection.
-        # We use a tiny 2-dim float vector that is always [0, 0] and
-        # exists purely to satisfy the schema requirement.
         FieldSchema(name="_vec",       dtype=DataType.FLOAT_VECTOR, dim=2),
     ]
-    schema     = CollectionSchema(
-        fields=fields,
-        description="Ordered chat memory — CyberSec AI",
-    )
+    schema     = CollectionSchema(fields=fields, description="Chat memory — CyberSec AI")
     collection = Collection(name=CHAT_MEMORY_COLLECTION, schema=schema)
 
-    # Scalar index on created_at for ordered queries
     try:
         collection.create_index(
             field_name="created_at",
@@ -75,12 +65,10 @@ def _build_collection() -> Collection:
     except Exception:
         pass
 
-    # Required vector index (FLAT, never used for search)
     collection.create_index(
         field_name="_vec",
         index_params={"index_type": "FLAT", "metric_type": "L2"},
     )
-
     collection.load()
     return collection
 
@@ -95,7 +83,7 @@ def get_collection() -> Collection:
 
 
 def append_message(session_id: str, role: str, content: str) -> dict[str, Any]:
-    """Insert one conversation turn into Milvus chat_memory."""
+    """Insert one conversation turn."""
     col = get_collection()
     payload = {
         "id":         str(uuid.uuid4()),
@@ -111,15 +99,7 @@ def append_message(session_id: str, role: str, content: str) -> dict[str, Any]:
 
 
 def get_recent_messages(session_id: str, limit: int = 6) -> list[dict[str, Any]]:
-    """
-    Fetch the last `limit` messages for a session, in chronological order.
-    Equivalent to:
-      SELECT role, content, created_at
-      FROM chat_memory
-      WHERE session_id = :session_id
-      ORDER BY created_at DESC
-      LIMIT :limit
-    """
+    """Fetch the last `limit` messages for a session, in chronological order."""
     col  = get_collection()
     safe = session_id.replace('"', '\\"')
     rows = col.query(
@@ -158,8 +138,7 @@ def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
             grouped[sid]["created_at"] = min(grouped[sid]["created_at"], created_at)
             if row.get("role") == "user" and content:
                 grouped[sid]["summary"] = content[:100]
-    sessions = sorted(grouped.values(), key=lambda r: r["updated_at"], reverse=True)
-    return sessions[:limit]
+    return sorted(grouped.values(), key=lambda r: r["updated_at"], reverse=True)[:limit]
 
 
 def clear_session(session_id: str) -> int:

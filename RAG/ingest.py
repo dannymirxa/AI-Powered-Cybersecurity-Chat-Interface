@@ -1,66 +1,61 @@
 """
-Module 2: Markdown → Vectors → Milvus
-Embeds text chunks with Ollama (nomic-embed-text) and stores them in Milvus.
+RAG/ingest.py
+─────────────
+Pipeline: Markdown → chunks → embeddings → Milvus.
 
-Requirements:
-  - Milvus running via Docker Compose (see docker-compose.yml)
-  - Ollama running locally with nomic-embed-text pulled
+All config is read from environment variables (see .env.example).
 
-Install: pip install pymilvus requests
-Pull model: ollama pull nomic-embed-text
+Usage:
+  python RAG/ingest.py path/to/file.md
+  python RAG/ingest.py path/to/file.md --recreate
 
-Milvus Docker Compose:
-  https://milvus.io/docs/install_standalone-docker-compose.md
+Inside Docker:
+  docker compose exec app python RAG/ingest.py RAG/your_doc.md
 """
 
+import os
 import requests
-import json
 from pymilvus import MilvusClient, DataType
-from pdf_to_markdown import chunk_markdown
-from typing import Optional
+from dotenv import load_dotenv
+from RAG.pdf_to_markdown import chunk_markdown
 
-# ── Config ──────────────────────────────────────────────────────────────────
-MILVUS_URI = "http://localhost:19530"
-COLLECTION_NAME = "cybersec_kb"
-EMBED_MODEL = "nomic-embed-text"
-EMBED_DIM = 768          # nomic-embed-text output dimension
-OLLAMA_URL = "http://localhost:11434"
-BATCH_SIZE = 32          # chunks per Milvus insert call
+load_dotenv()
+
+MILVUS_URI      = os.getenv("MILVUS_URI",      "http://localhost:19530")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "cybersec_kb")
+EMBED_MODEL     = os.getenv("EMBED_MODEL",      "nomic-embed-text")
+OLLAMA_URL      = os.getenv("OLLAMA_URL",       "http://localhost:11434")
+EMBED_TIMEOUT   = int(os.getenv("EMBED_TIMEOUT", "60"))
+BATCH_SIZE      = int(os.getenv("INGEST_BATCH_SIZE", "32"))
+
+EMBED_DIM = 768  # nomic-embed-text output dimension
 
 
-# ── Embedding ────────────────────────────────────────────────────────────────
 def get_embedding(text: str) -> list[float]:
-    """Call Ollama /api/embeddings and return the embedding vector."""
     resp = requests.post(
         f"{OLLAMA_URL}/api/embeddings",
         json={"model": EMBED_MODEL, "prompt": text},
-        timeout=60,
+        timeout=EMBED_TIMEOUT,
     )
     resp.raise_for_status()
     return resp.json()["embedding"]
 
 
 def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
-    """Embed a list of texts, one call per text (Ollama has no batch endpoint)."""
     return [get_embedding(t) for t in texts]
 
 
-# ── Milvus helpers ───────────────────────────────────────────────────────────
 def get_client() -> MilvusClient:
     return MilvusClient(uri=MILVUS_URI)
 
 
 def create_collection(client: MilvusClient, recreate: bool = False) -> None:
-    """
-    Create the cybersec_kb collection with schema:
-      id (auto INT64 PK) | vector (FLOAT_VECTOR) | text (VARCHAR) | source (VARCHAR) | chunk_index (INT64)
-    """
     if client.has_collection(COLLECTION_NAME):
         if recreate:
             client.drop_collection(COLLECTION_NAME)
-            print(f"🗑️  Dropped existing collection '{COLLECTION_NAME}'")
+            print(f"Dropped collection '{COLLECTION_NAME}'")
         else:
-            print(f"ℹ️  Collection '{COLLECTION_NAME}' already exists — skipping creation.")
+            print(f"Collection '{COLLECTION_NAME}' already exists — skipping creation.")
             return
 
     schema = client.create_schema(auto_id=True, enable_dynamic_field=False)
@@ -82,28 +77,14 @@ def create_collection(client: MilvusClient, recreate: bool = False) -> None:
         schema=schema,
         index_params=index_params,
     )
-    print(f"✅ Created collection '{COLLECTION_NAME}'")
+    print(f"Created collection '{COLLECTION_NAME}'")
 
 
 def insert_chunks(client: MilvusClient, chunks: list[dict]) -> int:
-    """
-    Embed and insert chunks into Milvus in batches.
-
-    Args:
-        client: Connected MilvusClient.
-        chunks: Output of chunk_markdown() — list of {text, chunk_index, source}.
-
-    Returns:
-        Total number of records inserted.
-    """
     total = 0
     for i in range(0, len(chunks), BATCH_SIZE):
-        batch = chunks[i : i + BATCH_SIZE]
-        texts = [c["text"] for c in batch]
-
-        print(f"  🔢 Embedding chunks {i}–{i+len(batch)-1}...")
-        vectors = get_embeddings_batch(texts)
-
+        batch   = chunks[i : i + BATCH_SIZE]
+        vectors = get_embeddings_batch([c["text"] for c in batch])
         data = [
             {
                 "vector":      vec,
@@ -115,35 +96,24 @@ def insert_chunks(client: MilvusClient, chunks: list[dict]) -> int:
         ]
         client.insert(collection_name=COLLECTION_NAME, data=data)
         total += len(batch)
-        print(f"  ✅ Inserted {total}/{len(chunks)} chunks")
-
+        print(f"  Inserted {total}/{len(chunks)} chunks")
     return total
 
 
-# ── Main ingestion pipeline ──────────────────────────────────────────────────
 def ingest_markdown(md_path: str, recreate: bool = False) -> None:
-    """
-    Full pipeline: Markdown file → chunks → embeddings → Milvus.
-
-    Args:
-        md_path:  Path to the .md file produced by pdf_to_markdown.
-        recreate: If True, drop and recreate the collection first.
-    """
-    print(f"\n📂 Loading markdown: {md_path}")
+    print(f"Loading: {md_path}")
     chunks = chunk_markdown(md_path)
-    print(f"📄 {len(chunks)} chunks ready for ingestion")
+    print(f"{len(chunks)} chunks ready")
 
     client = get_client()
     create_collection(client, recreate=recreate)
 
-    print(f"\n⬆️  Inserting into Milvus '{COLLECTION_NAME}'...")
+    print(f"Inserting into '{COLLECTION_NAME}' ...")
     total = insert_chunks(client, chunks)
-    print(f"\n🎉 Done! {total} chunks stored in Milvus.")
+    print(f"Done. {total} chunks stored.")
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
     import argparse
 
     parser = argparse.ArgumentParser(description="Ingest markdown into Milvus")
@@ -151,7 +121,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--recreate",
         action="store_true",
-        help="Drop and recreate the Milvus collection",
+        help="Drop and recreate the Milvus collection before ingesting",
     )
     args = parser.parse_args()
     ingest_markdown(args.md_path, recreate=args.recreate)
