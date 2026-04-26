@@ -1,6 +1,8 @@
 __pycache__/
 tools/__pycache__/
+RAG/__pycache__
 .env
 .vscode/
 raw_docs/
 volumes/
+*__init__.py*

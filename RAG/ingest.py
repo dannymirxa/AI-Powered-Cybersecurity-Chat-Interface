@@ -17,7 +17,7 @@ import os
 import requests
 from pymilvus import MilvusClient, DataType
 from dotenv import load_dotenv
-from RAG.pdf_to_markdown import chunk_markdown
+from pdf_to_markdown import chunk_markdown
 
 load_dotenv()
 
