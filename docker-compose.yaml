@@ -1,64 +1,178 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CyberSec AI — Full Stack
+#
+# Services:
+#   app       — FastAPI backend + Streamlit UI
+#   ollama    — Local LLM server (mistral:8b + nomic-embed-text)
+#   etcd      — Milvus metadata store
+#   minio     — Milvus object storage
+#   milvus    — Vector + scalar database
+#
+# First-time setup (pull models into the named volume):
+#   docker compose run --rm ollama-init
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
+
+  # ── Ollama ─────────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cybersec-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Expose GPU if available; harmless on CPU-only hosts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - cybersec-net
+
+  # One-shot initialiser: pulls the two required models then exits.
+  # Run once with:  docker compose run --rm ollama-init
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: cybersec-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Pulling mistral-nemo:8b ...' &&
+        ollama pull ministral:8b &&
+        echo 'Pulling nomic-embed-text ...' &&
+        ollama pull nomic-embed-text &&
+        echo 'Models ready.'
+      "
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    networks:
+      - cybersec-net
+    profiles:
+      - init
+
+  # ── Milvus stack ───────────────────────────────────────────────────────────
   etcd:
     container_name: milvus-etcd
     image: quay.io/coreos/etcd:v3.5.25
+    restart: unless-stopped
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
       - ETCD_AUTO_COMPACTION_RETENTION=1000
       - ETCD_QUOTA_BACKEND_BYTES=4294967296
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
-    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+      - etcd_data:/etcd
+    command: etcd
+      -advertise-client-urls=http://etcd:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 30s
       timeout: 20s
       retries: 3
+    networks:
+      - cybersec-net
 
   minio:
     container_name: milvus-minio
     image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    restart: unless-stopped
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
-    ports:
-      - "9001:9001"
-      - "9000:9000"
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+      - minio_data:/minio_data
     command: minio server /minio_data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
       timeout: 20s
       retries: 3
+    networks:
+      - cybersec-net
 
-  standalone:
+  milvus:
     container_name: milvus-standalone
     image: milvusdb/milvus:v2.6.15
+    restart: unless-stopped
     command: ["milvus", "run", "standalone"]
     security_opt:
-    - seccomp:unconfined
+      - seccomp:unconfined
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
       MQ_TYPE: woodpecker
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
       start_period: 90s
       timeout: 20s
       retries: 3
-    ports:
-      - "19530:19530"
-      - "9091:9091"
-    depends_on:
-      - "etcd"
-      - "minio"
+    networks:
+      - cybersec-net
 
+  # ── Application ────────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cybersec-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"   # FastAPI backend
+      - "8501:8501"   # Streamlit UI
+    env_file:
+      - .env
+    environment:
+      # Override individual vars so service names resolve inside Docker network
+      OLLAMA_URL:  http://ollama:11434
+      MILVUS_URI:  http://milvus:19530
+      API_URL:     http://app:8000
+    depends_on:
+      ollama:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    networks:
+      - cybersec-net
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+volumes:
+  ollama_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+
+# ── Network ────────────────────────────────────────────────────────────────────
 networks:
-  defauai-cybersecurity-bot:
-    external: true
+  cybersec-net:
+    driver: bridge
