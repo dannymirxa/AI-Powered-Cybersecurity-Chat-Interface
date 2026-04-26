@@ -3,18 +3,20 @@ agents/chat_memory.py
 ─────────────────────
 Simple Milvus-backed chat memory.
 
-Replaces MilvusCheckpointer with two lightweight functions:
+Replaces MilvusCheckpointer with lightweight functions:
   - append_message(session_id, role, content)  → insert a row
   - get_recent_messages(session_id, limit)      → SELECT TOP N ... ORDER BY created_at
   - list_sessions(limit)                        → all sessions with summary
   - clear_session(session_id)                   → delete all rows for a session
 
 Milvus collection schema (auto-created on first use):
-  id          VARCHAR(64)   primary key
-  session_id  VARCHAR(128)  partition key
-  role        VARCHAR(32)   'user' | 'assistant'
+  id          VARCHAR(64)    primary key
+  session_id  VARCHAR(128)
+  role        VARCHAR(32)    'user' | 'assistant'
   content     VARCHAR(12000)
-  created_at  INT64         epoch-milliseconds
+  created_at  INT64          epoch-milliseconds
+  _vec        FLOAT_VECTOR(2) dummy — Milvus requires at least one vector field;
+                              always stored as [0.0, 0.0] and never queried.
 """
 
 import os
@@ -35,6 +37,10 @@ MILVUS_URI             = os.getenv("MILVUS_URI", "http://localhost:19530")
 CHAT_MEMORY_COLLECTION = os.getenv("CHAT_MEMORY_COLLECTION", "chat_memory")
 CHAT_MEMORY_MAX_TEXT   = int(os.getenv("CHAT_MEMORY_MAX_TEXT", "12000"))
 
+# Dummy vector stored with every row so Milvus schema validation passes.
+# The field is never used for similarity search.
+_DUMMY_VEC = [0.0, 0.0]
+
 
 def _connect() -> None:
     connections.connect(alias="default", uri=MILVUS_URI)
@@ -49,10 +55,18 @@ def _build_collection() -> Collection:
         FieldSchema(name="content",    dtype=DataType.VARCHAR,
                     max_length=CHAT_MEMORY_MAX_TEXT),
         FieldSchema(name="created_at", dtype=DataType.INT64),
+        # Milvus requires at least one vector field per collection.
+        # We use a tiny 2-dim float vector that is always [0, 0] and
+        # exists purely to satisfy the schema requirement.
+        FieldSchema(name="_vec",       dtype=DataType.FLOAT_VECTOR, dim=2),
     ]
-    schema     = CollectionSchema(fields=fields,
-                                  description="Ordered chat memory — CyberSec AI")
+    schema     = CollectionSchema(
+        fields=fields,
+        description="Ordered chat memory — CyberSec AI",
+    )
     collection = Collection(name=CHAT_MEMORY_COLLECTION, schema=schema)
+
+    # Scalar index on created_at for ordered queries
     try:
         collection.create_index(
             field_name="created_at",
@@ -60,6 +74,13 @@ def _build_collection() -> Collection:
         )
     except Exception:
         pass
+
+    # Required vector index (FLAT, never used for search)
+    collection.create_index(
+        field_name="_vec",
+        index_params={"index_type": "FLAT", "metric_type": "L2"},
+    )
+
     collection.load()
     return collection
 
@@ -82,6 +103,7 @@ def append_message(session_id: str, role: str, content: str) -> dict[str, Any]:
         "role":       role,
         "content":    (content or "")[:CHAT_MEMORY_MAX_TEXT],
         "created_at": int(time.time() * 1000),
+        "_vec":       _DUMMY_VEC,
     }
     col.insert([payload])
     col.flush()
