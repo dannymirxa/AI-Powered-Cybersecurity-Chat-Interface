@@ -33,11 +33,15 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/"]
-      interval: 30s
+      # Use the /api/tags endpoint — it responds as soon as the HTTP server is
+      # ready, regardless of whether any models are loaded.
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 15s
       timeout: 10s
-      retries: 5
-      start_period: 30s
+      retries: 10
+      # GPU driver init + CUDA library loading can take 60-90 s on first start.
+      # start_period gives the container this long before failed checks count.
+      start_period: 120s
     networks:
       - cybersec-net
 
