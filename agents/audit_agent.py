@@ -12,7 +12,7 @@ import os
 
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 
 load_dotenv()
 
@@ -52,9 +52,9 @@ def create_audit_agent(tools: list):
     )
     print(f"✅ audit_agent model: {AGENT_MODEL}")
 
-    return create_agent(
+    return create_react_agent(
         model=llm,
         tools=audit_tools,
         name="audit_agent",
-        system_prompt=SYSTEM_PROMPT,
+        prompt=SYSTEM_PROMPT,
     )

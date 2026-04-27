@@ -11,7 +11,7 @@ import os
 
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 
 load_dotenv()
 
@@ -45,9 +45,9 @@ def create_rag_agent(tools: list):
     )
     print(f"✅ rag_agent model: {AGENT_MODEL}")
 
-    return create_agent(
+    return create_react_agent(
         model=llm,
         tools=rag_tools,
         name="rag_agent",
-        system_prompt=SYSTEM_PROMPT,
+        prompt=SYSTEM_PROMPT,
     )
